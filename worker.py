@@ -485,66 +485,80 @@ async def run(cfg: argparse.Namespace) -> None:
         heartbeat_loop(async_stub, worker_id, shared)
     )
 
-    # ── Step 6: GetAssignment (blocks until leader types "start") ─────────────
-    log.info("Waiting for assignment from leader …  (leader must type 'start')")
-    shared.status = trainer_pb2.IDLE
-
-    assignment_resp = await async_stub.GetAssignment(
-        trainer_pb2.GetAssignmentRequest(worker_id=worker_id)
-    )
-
-    assignment = assignment_resp.assignment
-    config     = assignment_resp.config
-    device     = _resolve_device(assignment.primary_device)
-
-    log.info(
-        f"Assignment received:  "
-        f"{len(assignment.indices):,} samples  "
-        f"batch={assignment.local_batch_size}  "
-        f"device={device}"
-    )
-
-    # ── Step 7: build model + load initial weights ────────────────────────────
+    # ── Steps 6-9: training loop — repeats for each new job ──────────────────
     _MODEL_FNS = {
         "resnet18":  models.resnet18,
         "resnet50":  models.resnet50,
         "resnet101": models.resnet101,
     }
-    model_fn = _MODEL_FNS.get(config.model_name, models.resnet101)
-    log.info(f"Building {config.model_name} ({config.num_classes} classes) on {device} …")
-    model = model_fn(weights=None, num_classes=config.num_classes)
-    load_full_weights(model, assignment_resp.model_weights, device)
-    model = model.to(device).train()
 
-    # ── Step 8: build dataloader for this worker's shard ──────────────────────
-    if cfg.dry_run:
-        n_synthetic = min(len(assignment.indices), 320)   # enough for ~10 batches
-        loader = _make_synthetic_loader(n_synthetic, assignment.local_batch_size, config.num_classes)
-        log.info(f"Synthetic DataLoader: {n_synthetic} samples  batch={assignment.local_batch_size}")
-    else:
-        loader = make_train_loader(
-            root       = None,
-            indices    = list(assignment.indices),
-            batch_size = assignment.local_batch_size,
-            cpu_cores  = hw.cpu_cores,
-        )
-    log.info(
-        f"DataLoader ready:  {len(loader.dataset):,} samples  "
-        f"batch={assignment.local_batch_size}  "
-        f"batches/epoch={len(loader)}"
-    )
-
-    # ── Step 9: training loop in thread pool ──────────────────────────────────
     try:
-        await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: training_loop(
-                model, loader, sync_stub,
-                worker_id, config, device, shared,
-            ),
-        )
+        while True:
+            # Step 6: wait for assignment
+            shared.status = trainer_pb2.IDLE
+            shared.stop   = False
+            shared.loss   = -1.0
+            shared.steps  = 0
+            log.info("Waiting for assignment from leader …  (leader must type 'start')")
+
+            assignment_resp = await async_stub.GetAssignment(
+                trainer_pb2.GetAssignmentRequest(worker_id=worker_id)
+            )
+
+            assignment = assignment_resp.assignment
+            config     = assignment_resp.config
+            device     = _resolve_device(assignment.primary_device)
+
+            log.info(
+                f"Assignment received:  "
+                f"{len(assignment.indices):,} samples  "
+                f"batch={assignment.local_batch_size}  "
+                f"device={device}"
+            )
+
+            # Step 7: build model + load initial weights
+            model_fn = _MODEL_FNS.get(config.model_name, models.resnet101)
+            log.info(f"Building {config.model_name} ({config.num_classes} classes) on {device} …")
+            model = model_fn(weights=None, num_classes=config.num_classes)
+            load_full_weights(model, assignment_resp.model_weights, device)
+            model = model.to(device).train()
+
+            # Step 8: build dataloader
+            if cfg.dry_run:
+                n_synthetic = min(len(assignment.indices), 320)
+                loader = _make_synthetic_loader(n_synthetic, assignment.local_batch_size, config.num_classes)
+                log.info(f"Synthetic DataLoader: {n_synthetic} samples  batch={assignment.local_batch_size}")
+            else:
+                loader = make_train_loader(
+                    root       = None,
+                    indices    = list(assignment.indices),
+                    batch_size = assignment.local_batch_size,
+                    cpu_cores  = hw.cpu_cores,
+                )
+            log.info(
+                f"DataLoader ready:  {len(loader.dataset):,} samples  "
+                f"batch={assignment.local_batch_size}  "
+                f"batches/epoch={len(loader)}"
+            )
+
+            # Step 9: training loop in thread pool
+            await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: training_loop(
+                    model, loader, sync_stub,
+                    worker_id, config, device, shared,
+                ),
+            )
+
+            if shared.stop:
+                # Error or STOP command from leader — exit worker
+                log.info("Stopping worker on leader instruction or training error.")
+                break
+
+            # Training completed normally — stay connected for next run
+            log.info("Training complete. Staying connected — waiting for next job (leader: 'reset' then 'start').")
+
     finally:
-        # Graceful cleanup
         hb_task.cancel()
         try:
             await hb_task

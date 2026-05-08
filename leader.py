@@ -75,7 +75,9 @@ class WorkerState:
 
     # asyncio primitives — created fresh per worker
     cmd_queue:        asyncio.Queue = field(default_factory=asyncio.Queue)
-    assignment_event: asyncio.Event = field(default_factory=asyncio.Event)
+    # Queue-based assignment: leader puts a sentinel per training run;
+    # worker's GetAssignment call blocks on get() and works across resets.
+    assignment_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
 
     @property
     def is_alive(self) -> bool:
@@ -220,8 +222,10 @@ class LeaderService(trainer_pb2_grpc.TrainerServiceServicer):
 
         log.info(f"Worker {wid} ({w.hostname}) waiting for assignment …")
 
-        # Block here until start_training() sets the per-worker event
-        await w.assignment_event.wait()
+        # Block until start_training() puts a sentinel in the queue.
+        # Using a Queue (not Event) means this works across multiple training
+        # runs without needing to replace the primitive on reset.
+        await w.assignment_queue.get()
 
         # Re-read in case state changed during the wait
         async with self._lock:
@@ -378,12 +382,47 @@ class LeaderService(trainer_pb2_grpc.TrainerServiceServicer):
 
         self._training_started.set()
 
-        # Unblock every worker's GetAssignment call simultaneously
+        # Unblock every waiting worker's GetAssignment call
         for w in alive:
-            w.assignment_event.set()
+            w.assignment_queue.put_nowait(True)
 
         log.info(
             f"Training started — assignments dispatched to {len(alive)} worker(s)."
+        )
+
+    # ── Public: reset for next training run ──────────────────────────────────
+
+    async def reset_training(self) -> None:
+        """
+        Reset leader state so the operator can run another training job
+        with the same connected workers.  Workers will automatically loop
+        back to GetAssignment and block until the next 'start'.
+        """
+        if not self._training_started.is_set():
+            log.warning("Nothing to reset — training has not started.")
+            return
+
+        self._training_started = asyncio.Event()   # fresh, unset
+
+        async with self._grad_cond:
+            self._pending_grads.clear()
+            self._grad_round      = 0
+            self._grad_round_start = 0.0
+
+        self._global_step   = 0
+        self._current_epoch = 0
+        self._global_loss   = 0.0
+        self._last_payload  = b""
+        self._prev_state    = {}
+        self._model         = None
+        self._optimizer     = None
+
+        async with self._lock:
+            n = len(self._workers)
+
+        log.info(
+            f"Reset complete — {n} worker(s) still connected and waiting. "
+            "Type 'start' to begin the next run."
         )
 
     # ── Background task: heartbeat monitor ───────────────────────────────────
@@ -633,7 +672,7 @@ def _infer_device(w: WorkerState) -> str:
 async def cli_loop(service: LeaderService) -> None:
     loop = asyncio.get_event_loop()
     print()
-    print("  Commands:  start | status | quit")
+    print("  Commands:  start | status | reset | quit")
     print()
     while True:
         try:
@@ -645,6 +684,8 @@ async def cli_loop(service: LeaderService) -> None:
             await service.start_training()
         elif cmd == "status":
             await service._print_status()
+        elif cmd == "reset":
+            await service.reset_training()
         elif cmd in ("quit", "exit", "q"):
             log.info("Shutting down.")
             sys.exit(0)
@@ -652,7 +693,7 @@ async def cli_loop(service: LeaderService) -> None:
             pass
         else:
             print(f"  Unknown command: {cmd!r}")
-            print("  Try: start | status | quit")
+            print("  Try: start | status | reset | quit")
 
 
 # ── Port conflict guard ───────────────────────────────────────────────────────
