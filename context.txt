@@ -108,6 +108,7 @@ All fixes committed and pushed to main:
 - 83dd643: heartbeat aio.sleep fix + broad exception handler
 - f264ba4: auto-kill stale leader on startup + worker connection retry loop
 - ea6d532: configurable heartbeat/grad-sync timeouts + liveness refresh on gradient push
+- a17d836: persistent workers + reset command + live cluster watcher
 
 
 # IN-PROGRESS WORK
