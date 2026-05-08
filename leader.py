@@ -119,6 +119,9 @@ class LeaderService(trainer_pb2_grpc.TrainerServiceServicer):
         self._raw_gradient_numel:        int = 0
         self._compressed_gradient_numel: int = 0
 
+        # Workers that registered mid-training but await manual admission
+        self._pending_worker_ids: set[str] = set()
+
         # Gradient synchronisation across workers
         # asyncio.Condition protects _pending_grads and _grad_round.
         # Workers block in wait_for() until the round increments.
@@ -172,11 +175,12 @@ class LeaderService(trainer_pb2_grpc.TrainerServiceServicer):
         )
 
         if self._training_started.is_set():
-            # Late joiner — assign shard from full dataset and unblock immediately.
-            # Existing worker shards are untouched; some index overlap is acceptable
-            # since the parameter server aggregates gradients across all workers.
-            await self._assign_late_worker(state)
-            log.info(f"[late join] {wid} added to running training.")
+            # Hold in pending pool — operator admits via watch.py / 'admit' command.
+            self._pending_worker_ids.add(wid)
+            log.info(
+                f"[pending] {wid} ({hw.hostname}) waiting for admission. "
+                f"Use 'admit {wid}' or 'admit all' in watch.py."
+            )
         else:
             # Auto-start once threshold is met (if flag is set)
             if self.cfg.auto_start:
@@ -355,11 +359,62 @@ class LeaderService(trainer_pb2_grpc.TrainerServiceServicer):
             )
             for w in workers
         ]
+        pending = [
+            trainer_pb2.PendingWorkerInfo(
+                worker_id       = w.worker_id,
+                hostname        = w.hostname,
+                score           = w.score,
+                accel_summary   = w.accel_summary,
+                waiting_seconds = int(time.monotonic() - w.registered_at),
+            )
+            for wid, w in self._workers.items()
+            if wid in self._pending_worker_ids
+        ]
+
         return trainer_pb2.ClusterStatusResponse(
-            workers       = summaries,
-            global_step   = self._global_step,
-            global_loss   = self._global_loss,
-            current_epoch = self._current_epoch,
+            workers         = summaries,
+            global_step     = self._global_step,
+            global_loss     = self._global_loss,
+            current_epoch   = self._current_epoch,
+            pending_workers = pending,
+        )
+
+    # ── RPC: AdmitWorkers ─────────────────────────────────────────────────────
+
+    async def AdmitWorkers(
+        self,
+        request: trainer_pb2.AdmitWorkersRequest,
+        context,
+    ) -> trainer_pb2.AdmitWorkersResponse:
+        if not self._training_started.is_set():
+            await context.abort(
+                grpc.StatusCode.FAILED_PRECONDITION,
+                "Training has not started — workers will be admitted automatically at start.",
+            )
+            return
+
+        ids_to_admit = list(request.worker_ids) or list(self._pending_worker_ids)
+        admitted, not_found = [], []
+
+        for wid in ids_to_admit:
+            if wid not in self._pending_worker_ids:
+                not_found.append(wid)
+                continue
+            async with self._lock:
+                w = self._workers.get(wid)
+            if w is None or not w.is_alive:
+                self._pending_worker_ids.discard(wid)
+                not_found.append(wid)
+                continue
+            await self._assign_late_worker(w)
+            self._pending_worker_ids.discard(wid)
+            admitted.append(wid)
+            log.info(f"[admit] {wid} ({w.hostname}) admitted to running training.")
+
+        return trainer_pb2.AdmitWorkersResponse(
+            admitted_count = len(admitted),
+            admitted_ids   = admitted,
+            not_found_ids  = not_found,
         )
 
     # ── Public: kick off training ─────────────────────────────────────────────
@@ -477,6 +532,7 @@ class LeaderService(trainer_pb2_grpc.TrainerServiceServicer):
                 for w in dead:
                     log.warning(f"[-] Worker {w.worker_id} ({w.hostname}) timed out.")
                     del self._workers[w.worker_id]
+                    self._pending_worker_ids.discard(w.worker_id)
 
             if self._training_started.is_set():
                 async with self._grad_cond:

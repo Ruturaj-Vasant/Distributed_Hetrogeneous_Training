@@ -157,11 +157,30 @@ message WorkerSummary {
   int64        last_seen_ts = 6;
 }
 
+message PendingWorkerInfo {
+  string worker_id          = 1;
+  string hostname           = 2;
+  float  score              = 3;
+  string accel_summary      = 4;
+  int32  waiting_seconds    = 5;
+}
+
+message AdmitWorkersRequest {
+  repeated string worker_ids = 1;  // empty = admit all pending
+}
+
+message AdmitWorkersResponse {
+  int32           admitted_count = 1;
+  repeated string admitted_ids   = 2;
+  repeated string not_found_ids  = 3;
+}
+
 message ClusterStatusResponse {
-  repeated WorkerSummary workers       = 1;
-  int64                  global_step   = 2;
-  float                  global_loss   = 3;
-  int32                  current_epoch = 4;
+  repeated WorkerSummary    workers         = 1;
+  int64                     global_step     = 2;
+  float                     global_loss     = 3;
+  int32                     current_epoch   = 4;
+  repeated PendingWorkerInfo pending_workers = 5;
 }
 
 // ─────────────────────────────────────────────
@@ -184,4 +203,7 @@ service TrainerService {
 
   // Dashboard / monitoring query
   rpc GetClusterStatus (ClusterStatusRequest) returns (ClusterStatusResponse);
+
+  // Admit one or more pending workers into the active training run
+  rpc AdmitWorkers (AdmitWorkersRequest) returns (AdmitWorkersResponse);
 }

@@ -405,11 +405,22 @@ async def test_late_registration_accepted(port: int) -> None:
             trainer_pb2.RegisterRequest(hw_info=hw, benchmark=bm)
         )
         await ch.close()
-        _check("T10 late worker accepted",      reg.accepted,
+        wid = reg.worker_id
+        _check("T10 late worker accepted",       reg.accepted,
                f"reason={reg.reject_reason!r}")
-        _check("T10b late worker has shard",
-               service._workers[reg.worker_id].shard_indices != [],
-               "shard is empty")
+        _check("T10b late worker in pending pool",
+               wid in service._pending_worker_ids,
+               "worker not in pending pool")
+        _check("T10c shard empty until admitted",
+               service._workers[wid].shard_indices == [],
+               "shard should be empty before admission")
+        # Now admit and verify shard is assigned
+        await service.AdmitWorkers(
+            trainer_pb2.AdmitWorkersRequest(worker_ids=[wid]), context=None
+        )
+        _check("T10d shard assigned after admit",
+               service._workers[wid].shard_indices != [],
+               "shard still empty after admit")
     finally:
         await server.stop(grace=1)
 

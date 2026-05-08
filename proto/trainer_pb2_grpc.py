@@ -63,6 +63,11 @@ class TrainerServiceStub(object):
                 request_serializer=trainer__pb2.ClusterStatusRequest.SerializeToString,
                 response_deserializer=trainer__pb2.ClusterStatusResponse.FromString,
                 _registered_method=True)
+        self.AdmitWorkers = channel.unary_unary(
+                '/trainer.TrainerService/AdmitWorkers',
+                request_serializer=trainer__pb2.AdmitWorkersRequest.SerializeToString,
+                response_deserializer=trainer__pb2.AdmitWorkersResponse.FromString,
+                _registered_method=True)
 
 
 class TrainerServiceServicer(object):
@@ -108,6 +113,13 @@ class TrainerServiceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def AdmitWorkers(self, request, context):
+        """Admit one or more pending workers into the active training run
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_TrainerServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -135,6 +147,11 @@ def add_TrainerServiceServicer_to_server(servicer, server):
                     servicer.GetClusterStatus,
                     request_deserializer=trainer__pb2.ClusterStatusRequest.FromString,
                     response_serializer=trainer__pb2.ClusterStatusResponse.SerializeToString,
+            ),
+            'AdmitWorkers': grpc.unary_unary_rpc_method_handler(
+                    servicer.AdmitWorkers,
+                    request_deserializer=trainer__pb2.AdmitWorkersRequest.FromString,
+                    response_serializer=trainer__pb2.AdmitWorkersResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -276,6 +293,33 @@ class TrainerService(object):
             '/trainer.TrainerService/GetClusterStatus',
             trainer__pb2.ClusterStatusRequest.SerializeToString,
             trainer__pb2.ClusterStatusResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def AdmitWorkers(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/trainer.TrainerService/AdmitWorkers',
+            trainer__pb2.AdmitWorkersRequest.SerializeToString,
+            trainer__pb2.AdmitWorkersResponse.FromString,
             options,
             channel_credentials,
             insecure,
