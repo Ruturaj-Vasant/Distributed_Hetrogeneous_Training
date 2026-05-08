@@ -121,7 +121,9 @@ class LeaderService(trainer_pb2_grpc.TrainerServiceServicer):
 
         # Dataset info — resolved from cfg.dataset at training start
         _ds = get_dataset_info(getattr(cfg, "dataset", "tinyimagenet"))
-        self._train_samples: int = _ds["train_samples"]
+        _full = _ds["train_samples"]
+        _cap  = getattr(cfg, "train_samples", None)
+        self._train_samples: int = min(_full, _cap) if _cap else _full
         self._num_classes:   int = _ds["num_classes"]
 
         # Gradient numel — populated by _init_model()
@@ -1091,6 +1093,8 @@ if __name__ == "__main__":
                    choices=["tinyimagenet", "cifar10"],
                    help="Dataset to train on (default: tinyimagenet)")
     p.add_argument("--epochs",       type=int,   default=90)
+    p.add_argument("--train-samples", type=int,  default=None, dest="train_samples",
+                   help="Cap the number of training samples per epoch (default: use full dataset)")
     p.add_argument("--lr",           type=float, default=0.1)
     p.add_argument("--weight-decay", type=float, default=1e-4, dest="weight_decay")
     p.add_argument("--batch-size",   type=int,   default=32,   dest="batch_size",
