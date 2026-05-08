@@ -188,6 +188,8 @@ async def heartbeat_loop(
     Worker sends status every 5 s; leader replies with a command.
     Runs as an asyncio background task for the entire lifetime of the worker.
     """
+    import asyncio as _asyncio
+
     async def _requests():
         while not shared.stop:
             yield trainer_pb2.HeartbeatRequest(
@@ -197,7 +199,7 @@ async def heartbeat_loop(
                 steps_completed = shared.steps,
                 timestamp_utc   = int(time.time()),
             )
-            await aio.sleep(5)
+            await _asyncio.sleep(5)
 
     try:
         async for resp in stub.Heartbeat(_requests()):
@@ -213,8 +215,10 @@ async def heartbeat_loop(
                 if shared.paused:
                     log.info("Leader sent CONTINUE — resuming.")
                 shared.paused = False
-    except aio.AioRpcError as e:
-        log.error(f"Heartbeat stream lost: {e.code()}  {e.details()}")
+    except _asyncio.CancelledError:
+        pass
+    except Exception as e:
+        log.error(f"Heartbeat stream lost: {type(e).__name__}: {e}")
         shared.stop = True
 
 
