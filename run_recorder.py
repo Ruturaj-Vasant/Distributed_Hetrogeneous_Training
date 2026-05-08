@@ -53,7 +53,7 @@ class RunRecorder:
         self._csv_path = self.run_dir / "metrics.csv"
         self._csv_file = open(self._csv_path, "w", newline="")
         self._writer   = csv.writer(self._csv_file)
-        self._writer.writerow(["step", "loss", "epoch", "val_acc"])
+        self._writer.writerow(["step", "loss", "round_ms", "epoch", "val_acc"])
         self._csv_file.flush()
 
         self._steps:  list[int]            = []
@@ -64,17 +64,17 @@ class RunRecorder:
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def log_step(self, step: int, loss: float) -> None:
+    def log_step(self, step: int, loss: float, round_ms: float = 0.0) -> None:
         self._steps.append(step)
         self._losses.append(loss)
         self._last_loss = loss
-        self._writer.writerow([step, f"{loss:.6f}", "", ""])
+        self._writer.writerow([step, f"{loss:.6f}", f"{round_ms:.1f}", "", ""])
         self._csv_file.flush()
 
     def log_epoch(self, epoch: int, val_acc: float) -> None:
         self._epoch_accs.append((epoch, val_acc))
         self._last_val_acc = val_acc
-        self._writer.writerow(["", "", epoch, f"{val_acc:.4f}"])
+        self._writer.writerow(["", "", "", epoch, f"{val_acc:.4f}"])
         self._csv_file.flush()
 
     def close(self) -> Path:

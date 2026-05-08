@@ -123,6 +123,10 @@ class LeaderService(trainer_pb2_grpc.TrainerServiceServicer):
         self._grad_round_start: float = 0.0   # monotonic time when first grad arrived this round
         self._last_payload: bytes = b""
 
+        # Per-worker step latency tracking (set while _grad_cond is held)
+        self._grad_arrival: dict[str, float] = {}   # worker_id → monotonic arrival time
+        self._prev_round_end: float = 0.0            # when the previous round finished
+
     # ── RPC: Register ─────────────────────────────────────────────────────────
 
     async def Register(
@@ -296,6 +300,7 @@ class LeaderService(trainer_pb2_grpc.TrainerServiceServicer):
             if not self._pending_grads:
                 self._grad_round_start = time.monotonic()   # first grad this round
             self._pending_grads[wid] = request
+            self._grad_arrival[wid]  = time.monotonic()
             n_alive    = await self._count_alive()
             n_received = len(self._pending_grads)
 
@@ -667,14 +672,36 @@ class LeaderService(trainer_pb2_grpc.TrainerServiceServicer):
         buf = io.BytesIO()
         torch.save(delta, buf)
         self._last_payload = buf.getvalue()
+        # ── Per-worker step latency ───────────────────────────────────────────
+        round_end     = time.monotonic()
+        arrivals      = dict(self._grad_arrival)
+        prev_end      = self._prev_round_end
+        self._prev_round_end = round_end
         self._pending_grads.clear()
+        self._grad_arrival.clear()
 
-        if self._global_step % 10 == 0:
+        # Build per-worker stats: compute time (train step) + wait time (straggler idle)
+        latency_parts = []
+        max_wait_ms   = 0.0
+        for wid, arrival in arrivals.items():
+            compute_ms = (arrival - prev_end) * 1000 if prev_end > 0 else 0.0
+            wait_ms    = (round_end - arrival) * 1000
+            max_wait_ms = max(max_wait_ms, wait_ms)
+            hostname   = self._workers[wid].hostname if wid in self._workers else wid
+            latency_parts.append((hostname, compute_ms, wait_ms))
+
+        round_ms = (round_end - min(arrivals.values())) * 1000 if arrivals else 0.0
+
+        if self._global_step % 10 == 0 or len(arrivals) > 1:
+            parts_str = "  ".join(
+                f"{h}: compute={c:.0f}ms wait={w:.0f}ms"
+                + (" ← straggler" if w == max_wait_ms and w > 200 and len(arrivals) > 1 else "")
+                for h, c, w in latency_parts
+            )
             log.info(
-                f"Step {self._global_step:>6,}  "
-                f"loss={self._global_loss:.4f}  "
-                f"delta={len(self._last_payload) // 1024:,}KB  "
-                f"workers={len(grads)}"
+                f"Step {self._global_step:>6,}  loss={self._global_loss:.4f}  "
+                f"round={round_ms:.0f}ms  delta={len(self._last_payload) // 1024:,}KB"
+                + (f"\n          {parts_str}" if len(arrivals) > 1 else "")
             )
 
         # Epoch tracking (approximate — assumes all workers finish same #steps)
@@ -682,7 +709,7 @@ class LeaderService(trainer_pb2_grpc.TrainerServiceServicer):
         self._current_epoch = self._global_step // steps_per_epoch
 
         if self._recorder:
-            self._recorder.log_step(self._global_step, self._global_loss)
+            self._recorder.log_step(self._global_step, self._global_loss, round_ms)
 
         if self._current_epoch > old_epoch:
             val_acc = self._run_val_sync()
