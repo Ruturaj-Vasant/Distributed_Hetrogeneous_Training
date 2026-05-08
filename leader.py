@@ -830,10 +830,13 @@ class LeaderService(trainer_pb2_grpc.TrainerServiceServicer):
         if losses:
             self._global_loss = sum(losses) / len(losses)
 
-        # Compute parameter delta (new - old) and serialise
+        # Compute parameter delta (new - old) and serialise as float16
+        # float32 → float16 halves transfer size (43 MB → 22 MB) with negligible
+        # precision loss for typical LR-scaled deltas (magnitude << 1.0).
+        # apply_delta() on the worker uses add_() which handles mixed precision.
         new_state  = self._model.state_dict()
         delta = {
-            k: (v.cpu() - self._prev_state[k])
+            k: (v.cpu() - self._prev_state[k]).half()
             for k, v in new_state.items()
             if k in self._prev_state
         }

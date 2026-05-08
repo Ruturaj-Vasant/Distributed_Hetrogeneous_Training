@@ -264,6 +264,18 @@ def compress_gradients(
     MPS / CUDA tensors don't cause serialisation issues.
     """
     result: list[trainer_pb2.SparseGradient] = []
+
+    # Flush device command queue once before the per-layer loop.
+    # Without this, each .cpu() call below triggers an implicit sync of ALL
+    # pending device ops — 60+ syncs for ResNet18 instead of one.
+    params_with_grad = [(n, p) for n, p in model.named_parameters() if p.grad is not None]
+    if params_with_grad:
+        dev = params_with_grad[0][1].grad.device
+        if dev.type == "mps":
+            torch.mps.synchronize()
+        elif dev.type == "cuda":
+            torch.cuda.synchronize(dev)
+
     for name, param in model.named_parameters():
         if param.grad is None:
             continue
