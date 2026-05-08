@@ -552,7 +552,8 @@ class LeaderService(trainer_pb2_grpc.TrainerServiceServicer):
             )
             w.shard_indices    = indices[offset: offset + n]
             # Batch size scales with fraction but stays in [8, 64]
-            w.local_batch_size = max(8, min(64, int(32 * frac * len(workers))))
+            base = getattr(self.cfg, "batch_size", 32)
+            w.local_batch_size = max(8, min(256, int(base * frac * len(workers))))
             offset += n
             log.info(
                 f"  {w.hostname:<22}  score={w.score:>8.1f}  "
@@ -852,6 +853,8 @@ if __name__ == "__main__":
     p.add_argument("--num-classes",  type=int,   default=200, dest="num_classes")
     p.add_argument("--lr",           type=float, default=0.1)
     p.add_argument("--weight-decay", type=float, default=1e-4, dest="weight_decay")
+    p.add_argument("--batch-size",   type=int,   default=32,   dest="batch_size",
+                   help="Base batch size per worker (scales proportionally with score, default 32)")
     p.add_argument("--topk",         type=int,   default=50_000,
                    help="Top-K gradient elements per layer (0 = full gradients)")
     p.add_argument("--model",        default="resnet101", dest="model_name",

@@ -69,6 +69,7 @@ def _make_cfg(**overrides) -> argparse.Namespace:
         heartbeat_timeout        = 60.0,
         heartbeat_check_interval =  5.0,
         grad_sync_timeout        = 120.0,
+        batch_size               = 32,
         data_root                = None,
         runs_root                = "/tmp/distributed_resnet_test_runs",
     )
