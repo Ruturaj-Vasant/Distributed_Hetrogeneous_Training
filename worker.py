@@ -267,17 +267,18 @@ def compress_gradients(
     for name, param in model.named_parameters():
         if param.grad is None:
             continue
-        grad  = param.grad.detach().cpu().float()
+        grad  = param.grad.detach().float()   # stay on device — avoid full tensor CPU transfer
         shape = list(grad.shape)
         flat  = grad.flatten()
         n     = flat.numel()
 
         if topk_k > 0 and topk_k < n:
-            _, top_idx = torch.topk(flat.abs(), topk_k)
-            values     = flat[top_idx]
+            _, top_idx = torch.topk(flat.abs(), topk_k)   # topk on device (fast)
+            values     = flat[top_idx].cpu()              # move only the selected values
+            top_idx    = top_idx.to(torch.int32).cpu()    # move only the selected indices
         else:
             top_idx = torch.arange(n, dtype=torch.int32)
-            values  = flat
+            values  = flat.cpu()
 
         result.append(trainer_pb2.SparseGradient(
             layer_name = name,

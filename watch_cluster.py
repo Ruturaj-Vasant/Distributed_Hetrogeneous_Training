@@ -307,7 +307,8 @@ def main() -> None:
     with Live(
         initial,
         console=console,
-        refresh_per_second=4,    # visual refresh rate; data updates are manual
+        auto_refresh=False,      # we call live.refresh() manually — no cursor flicker while typing
+        refresh_per_second=4,
         transient=False,
         vertical_overflow="visible",
     ) as live:
@@ -343,6 +344,7 @@ def main() -> None:
                     live.update(_build_display(resp, addr))
                 except grpc.RpcError as e:
                     live.update(_unreachable(addr))
+                live.refresh()
                 last_refresh = time.monotonic()
 
             # Sleep until next check — wake early if a command arrives
