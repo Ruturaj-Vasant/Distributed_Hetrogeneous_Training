@@ -15,6 +15,7 @@ What this script does, in order:
             forward → loss.backward() → Top-K compress → ExchangeGradients RPC
             → apply weight delta from leader → repeat
 """
+from __future__ import annotations
 
 # ── Self-bootstrap: create .venv, install deps, generate proto stubs ──────────
 # Uses only stdlib so this block runs before any third-party imports.
@@ -97,7 +98,6 @@ _bootstrap()
 
 # ── Imports (guaranteed to succeed — either already in venv, or re-exec'd) ───
 
-from __future__ import annotations
 import argparse
 import asyncio
 import io
