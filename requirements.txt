@@ -1,0 +1,14 @@
+# Core ML
+torch>=2.2.0
+torchvision>=0.17.0
+
+# gRPC
+grpcio>=1.62.0
+grpcio-tools>=1.62.0
+protobuf>=4.25.0
+
+# System probing
+psutil>=5.9.0
+
+# Utilities
+numpy>=1.26.0

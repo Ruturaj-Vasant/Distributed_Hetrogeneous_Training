@@ -1,0 +1,186 @@
+syntax = "proto3";
+
+package trainer;
+
+// ─────────────────────────────────────────────
+//  Shared data structures
+// ─────────────────────────────────────────────
+
+message AcceleratorInfo {
+  enum AcceleratorType {
+    CPU  = 0;
+    CUDA = 1;
+    MPS  = 2;
+  }
+
+  AcceleratorType type      = 1;
+  string          name      = 2;  // e.g. "NVIDIA RTX 3060", "Apple M2 GPU"
+  float           vram_gb   = 3;  // 0 for CPU / MPS (uses unified memory)
+  int32           gpu_cores = 4;  // CUDA cores or Metal GPU cores
+  float           tflops    = 5;  // theoretical FP32 TFLOPS (0 if unknown)
+}
+
+message HardwareInfo {
+  string              hostname         = 1;
+  string              os               = 2;  // "darwin", "windows", "linux"
+  string              python_version   = 3;
+  string              torch_version    = 4;
+  int32               cpu_cores        = 5;  // logical cores
+  float               ram_gb           = 6;
+  repeated AcceleratorInfo accelerators = 7;
+}
+
+message BenchmarkResult {
+  float score             = 1;  // composite score (higher = more capable)
+  float forward_ms        = 2;  // forward-pass latency (ms) on microbenchmark
+  float memory_free_gb    = 3;  // free memory on primary accelerator at probe time
+}
+
+// ─────────────────────────────────────────────
+//  1. Worker Registration
+// ─────────────────────────────────────────────
+
+message RegisterRequest {
+  HardwareInfo    hw_info   = 1;
+  BenchmarkResult benchmark = 2;
+}
+
+message RegisterResponse {
+  string worker_id      = 1;   // UUID assigned by leader
+  bool   accepted       = 2;
+  string reject_reason  = 3;   // set only when accepted=false
+}
+
+// ─────────────────────────────────────────────
+//  2. Heartbeat
+// ─────────────────────────────────────────────
+
+enum WorkerStatus {
+  IDLE        = 0;
+  TRAINING    = 1;
+  DOWNLOADING = 2;
+  ERROR       = 3;
+}
+
+message HeartbeatRequest {
+  string       worker_id       = 1;
+  WorkerStatus status          = 2;
+  float        gpu_util_pct    = 3;   // 0-100
+  float        memory_used_gb  = 4;
+  float        current_loss    = 5;   // -1 if not training
+  int64        steps_completed = 6;
+  int64        timestamp_utc   = 7;   // Unix epoch seconds
+}
+
+message HeartbeatResponse {
+  enum LeaderCommand {
+    CONTINUE    = 0;
+    PAUSE       = 1;
+    STOP        = 2;
+    RECONFIGURE = 3;  // leader will follow up with a new ShardAssignment
+  }
+  LeaderCommand command = 1;
+}
+
+// ─────────────────────────────────────────────
+//  3. Training coordination
+// ─────────────────────────────────────────────
+
+message ShardAssignment {
+  string worker_id        = 1;
+  repeated int32 indices  = 2;  // dataset sample indices owned by this worker
+  int32  local_batch_size = 3;  // batch size this worker should use per step
+  string primary_device   = 4;  // "cuda:0", "mps", "cpu"
+}
+
+message TrainingConfig {
+  string model_name       = 1;  // "resnet101"
+  string dataset          = 2;  // "tiny_imagenet_200"
+  int32  num_classes      = 3;  // 200
+  int32  total_epochs     = 4;
+  float  base_lr          = 5;
+  float  weight_decay     = 6;
+  int32  gradient_topk_k  = 7;  // top-K for gradient compression (0 = no compression)
+}
+
+// Worker calls GetAssignment after registering.
+// The call BLOCKS on the leader until the operator runs "start".
+// Leader responds with the full shard, config, and initial model weights.
+message GetAssignmentRequest {
+  string worker_id = 1;
+}
+
+message GetAssignmentResponse {
+  ShardAssignment assignment    = 1;
+  TrainingConfig  config        = 2;
+  bytes           model_weights = 3;  // full serialised state_dict (torch.save bytes)
+}
+
+// ─────────────────────────────────────────────
+//  4. Gradient exchange
+// ─────────────────────────────────────────────
+
+message SparseGradient {
+  string layer_name      = 1;
+  repeated int32  indices = 2;  // flat indices of non-zero elements
+  repeated float  values  = 3;  // corresponding gradient values
+  repeated int32  shape   = 4;  // original tensor shape
+}
+
+message GradientPush {
+  string  worker_id           = 1;
+  int64   global_step         = 2;
+  int32   local_batch_count   = 3;  // number of samples this gradient covers
+  float   loss                = 4;
+  repeated SparseGradient gradients = 5;
+}
+
+message WeightUpdate {
+  int64  global_step           = 1;
+  bool   is_full_state_dict    = 2;   // true on first broadcast; false = delta only
+  bytes  payload               = 3;   // serialised weights / delta
+}
+
+// ─────────────────────────────────────────────
+//  5. Leader status query (optional dashboard)
+// ─────────────────────────────────────────────
+
+message ClusterStatusRequest {}
+
+message WorkerSummary {
+  string       worker_id    = 1;
+  string       hostname     = 2;
+  float        score        = 3;
+  WorkerStatus status       = 4;
+  float        shard_pct    = 5;  // percentage of dataset owned
+  int64        last_seen_ts = 6;
+}
+
+message ClusterStatusResponse {
+  repeated WorkerSummary workers       = 1;
+  int64                  global_step   = 2;
+  float                  global_loss   = 3;
+  int32                  current_epoch = 4;
+}
+
+// ─────────────────────────────────────────────
+//  Service definition
+// ─────────────────────────────────────────────
+
+service TrainerService {
+  // Worker calls once on startup to announce itself
+  rpc Register (RegisterRequest) returns (RegisterResponse);
+
+  // Bidirectional heartbeat: worker streams status, leader streams commands
+  rpc Heartbeat (stream HeartbeatRequest) returns (stream HeartbeatResponse);
+
+  // Worker calls after registering; BLOCKS until leader starts training,
+  // then returns shard assignment + config + initial model weights
+  rpc GetAssignment (GetAssignmentRequest) returns (GetAssignmentResponse);
+
+  // Worker pushes compressed gradients; leader aggregates, returns weight delta
+  rpc ExchangeGradients (GradientPush) returns (WeightUpdate);
+
+  // Dashboard / monitoring query
+  rpc GetClusterStatus (ClusterStatusRequest) returns (ClusterStatusResponse);
+}
