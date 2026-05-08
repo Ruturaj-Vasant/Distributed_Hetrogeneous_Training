@@ -381,8 +381,8 @@ async def test_two_workers_proportional_shards(port: int) -> None:
         await server.stop(grace=1)
 
 
-async def test_late_registration_rejected(port: int) -> None:
-    print("\n── Test 4: late registration is rejected ───────────────────────────")
+async def test_late_registration_accepted(port: int) -> None:
+    print("\n── Test 4: late worker joins mid-run ───────────────────────────────")
     cfg     = _make_cfg()
     service = LeaderService(cfg)
     server  = await _start_server(service, port)
@@ -397,7 +397,7 @@ async def test_late_registration_rejected(port: int) -> None:
             _trigger(),
         )
 
-        # Now try to register AFTER training started
+        # Register a second worker AFTER training started
         ch   = aio.insecure_channel(f"localhost:{port}", options=_GRPC_OPTIONS)
         stub = trainer_pb2_grpc.TrainerServiceStub(ch)
         hw, bm = _fake_hw("laptop-late", score=500.0)
@@ -405,8 +405,11 @@ async def test_late_registration_rejected(port: int) -> None:
             trainer_pb2.RegisterRequest(hw_info=hw, benchmark=bm)
         )
         await ch.close()
-        _check("T10 late worker rejected",      not reg.accepted,
+        _check("T10 late worker accepted",      reg.accepted,
                f"reason={reg.reject_reason!r}")
+        _check("T10b late worker has shard",
+               service._workers[reg.worker_id].shard_indices != [],
+               "shard is empty")
     finally:
         await server.stop(grace=1)
 
@@ -450,7 +453,7 @@ async def run_all_tests() -> None:
         test_single_worker_happy_path,
         test_heartbeat_alive_during_training,
         test_two_workers_proportional_shards,
-        test_late_registration_rejected,
+        test_late_registration_accepted,
         test_cluster_status_rpc,
     ]
 

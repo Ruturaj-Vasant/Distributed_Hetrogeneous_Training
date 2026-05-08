@@ -131,13 +131,6 @@ class LeaderService(trainer_pb2_grpc.TrainerServiceServicer):
         context,
     ) -> trainer_pb2.RegisterResponse:
 
-        if self._training_started.is_set():
-            # Late joiners not yet supported — could be added as a reconfigure
-            return trainer_pb2.RegisterResponse(
-                accepted=False,
-                reject_reason="Training already in progress.",
-            )
-
         hw  = request.hw_info
         bm  = request.benchmark
         wid = str(uuid.uuid4())[:8]
@@ -169,11 +162,18 @@ class LeaderService(trainer_pb2_grpc.TrainerServiceServicer):
             f"score={bm.score:>8.1f}  bench={bm.forward_ms:.1f}ms  {accel_summary}"
         )
 
-        # Auto-start once threshold is met (if flag is set)
-        if self.cfg.auto_start and not self._training_started.is_set():
-            alive = await self._count_alive()
-            if alive >= self.cfg.min_workers:
-                asyncio.create_task(self.start_training())
+        if self._training_started.is_set():
+            # Late joiner — assign shard from full dataset and unblock immediately.
+            # Existing worker shards are untouched; some index overlap is acceptable
+            # since the parameter server aggregates gradients across all workers.
+            await self._assign_late_worker(state)
+            log.info(f"[late join] {wid} added to running training.")
+        else:
+            # Auto-start once threshold is met (if flag is set)
+            if self.cfg.auto_start:
+                alive = await self._count_alive()
+                if alive >= self.cfg.min_workers:
+                    asyncio.create_task(self.start_training())
 
         return trainer_pb2.RegisterResponse(worker_id=wid, accepted=True)
 
@@ -532,8 +532,31 @@ class LeaderService(trainer_pb2_grpc.TrainerServiceServicer):
         return torch.device("cpu")
 
     async def _count_alive(self) -> int:
+        # Only count workers that have completed GetAssignment (assigned=True).
+        # Late joiners that are still loading data must not block the grad round.
         async with self._lock:
-            return sum(1 for w in self._workers.values() if w.is_alive)
+            return sum(1 for w in self._workers.values() if w.is_alive and w.assigned)
+
+    async def _assign_late_worker(self, w: WorkerState) -> None:
+        """Assign a shard to a worker that joined after training started."""
+        import random
+        async with self._lock:
+            workers = list(self._workers.values())
+
+        total_score = sum(wr.score for wr in workers) or 1.0
+        frac        = w.score / total_score
+        n           = max(1, int(frac * TINY_IMAGENET_TRAIN))
+        base        = getattr(self.cfg, "batch_size", 32)
+
+        w.shard_indices    = random.sample(range(TINY_IMAGENET_TRAIN), n)
+        w.local_batch_size = max(8, min(256, int(base * frac * len(workers))))
+
+        # Unblock the worker's GetAssignment call immediately.
+        w.assignment_queue.put_nowait(True)
+        log.info(
+            f"  late shard → {w.hostname:<22}  "
+            f"frac={frac*100:.1f}%  samples={n:,}  batch={w.local_batch_size}"
+        )
 
     # ── Private: shard distribution ───────────────────────────────────────────
 
