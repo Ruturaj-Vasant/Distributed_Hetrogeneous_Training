@@ -307,7 +307,7 @@ def main() -> None:
     with Live(
         initial,
         console=console,
-        refresh_per_second=0,    # manual updates only — no flicker
+        refresh_per_second=4,    # visual refresh rate; data updates are manual
         transient=False,
         vertical_overflow="visible",
     ) as live:
