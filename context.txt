@@ -62,13 +62,18 @@ two-machine real test.
 4. leader.py — parameter server + CLI
    - aio.server() with 256 MB message limits (fixed RESOURCE_EXHAUSTED bug)
    - Disabled grpc.so_reuseport so duplicate leaders cannot silently bind same port
+   - _kill_existing_leader(): SIGTERMs any process on the port before binding
    - Non-interactive mode: sys.stdin.isatty() check → uses server.wait_for_termination()
      instead of cli_loop() when stdin is not a TTY (subprocess/CI mode)
    - --model flag: resnet18/50/101, defaults to resnet101
    - Score-proportional sharding: worker_fraction = worker_score / sum(all_scores)
-   - Dead worker recovery in heartbeat_monitor()
+   - Dead worker recovery + grad-sync timeout in heartbeat_monitor()
    - asyncio.Condition for gradient sync (last worker to arrive aggregates)
    - Weight delta approach (not full state dict) after first sync
+   - Configurable timeouts: --heartbeat-timeout (60s), --heartbeat-check-interval (5s),
+     --grad-sync-timeout (120s)
+   - ExchangeGradients refreshes w.last_heartbeat on every gradient push
+   - _grad_round_start tracked; monitor forces aggregation if stuck > grad_sync_timeout
 
 5. worker.py — worker implementation
    - Two gRPC channels: async (aio) for heartbeat+GetAssignment, sync for ExchangeGradients
@@ -102,6 +107,7 @@ All fixes committed and pushed to main:
 - 089213e: gRPC 4 MB limit + non-interactive leader mode
 - 83dd643: heartbeat aio.sleep fix + broad exception handler
 - f264ba4: auto-kill stale leader on startup + worker connection retry loop
+- ea6d532: configurable heartbeat/grad-sync timeouts + liveness refresh on gradient push
 
 
 # IN-PROGRESS WORK
@@ -330,8 +336,9 @@ lsof -i :50051                        # verify what's listening on port
    Mitigation: Top-K compression reduces gradient payload, but weight delta is still full model.
    Future: consider sending only changed layers or using lower precision (fp16).
 
-6. [RISK] Dead worker mid-sync: heartbeat_monitor handles forced aggregation,
-   but if all workers die during a sync, the round hangs. Not fully tested.
+6. [MITIGATED] Dead worker mid-sync: heartbeat_monitor handles forced aggregation
+   for both dead-worker and grad_sync_timeout cases. If ALL workers die and no
+   gradients were received, the round is not forced (no-op). Reasonable tradeoff.
 
 7. [RISK] No gradient synchronization across epochs — each step is independent.
    If a worker falls behind, it gets stale weight deltas. Acceptable for now.
