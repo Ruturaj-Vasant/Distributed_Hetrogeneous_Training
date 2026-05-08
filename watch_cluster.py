@@ -2,7 +2,7 @@
 watch_cluster.py  —  Live cluster status monitor
 
 Usage:
-    python3 watch_cluster.py [--leader 127.0.0.1] [--port 50051] [--interval 3]
+    python3 watch_cluster.py [--leader leader-macbook-pro.taila5426e.ts.net] [--port 50051] [--interval 3]
 
 Polls GetClusterStatus every --interval seconds and prints a live table.
 Run in a separate terminal while leader and workers are active.
@@ -58,7 +58,7 @@ def _status_table(resp) -> str:
 
 def main():
     p = argparse.ArgumentParser(description="Live cluster status watcher")
-    p.add_argument("--leader",   default="127.0.0.1")
+    p.add_argument("--leader",   default="leader-macbook-pro.taila5426e.ts.net")
     p.add_argument("--port",     type=int, default=50051)
     p.add_argument("--interval", type=float, default=3.0,
                    help="Poll interval in seconds (default 3)")

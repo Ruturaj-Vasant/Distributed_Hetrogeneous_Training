@@ -35,7 +35,9 @@ import torchvision.models as models
 import grpc
 from grpc import aio
 
+from dataset import make_val_loader
 from proto import trainer_pb2, trainer_pb2_grpc
+from run_recorder import RunRecorder
 
 logging.basicConfig(
     level=logging.INFO,
@@ -108,6 +110,9 @@ class LeaderService(trainer_pb2_grpc.TrainerServiceServicer):
         self._global_step   = 0
         self._current_epoch = 0
         self._global_loss   = 0.0
+
+        # Run recorder (created at training start, closed on reset)
+        self._recorder: Optional[RunRecorder] = None
 
         # Gradient synchronisation across workers
         # asyncio.Condition protects _pending_grads and _grad_round.
@@ -382,6 +387,20 @@ class LeaderService(trainer_pb2_grpc.TrainerServiceServicer):
 
         self._training_started.set()
 
+        # Create run recorder
+        topk_k = getattr(self.cfg, "topk", 0)
+        self._recorder = RunRecorder(
+            model_name   = getattr(self.cfg, "model_name", "resnet101"),
+            dataset      = "tinyimagenet200",
+            optimizer    = "sgd",
+            topk_k       = topk_k,
+            epochs       = self.cfg.epochs,
+            lr           = self.cfg.lr,
+            weight_decay = self.cfg.weight_decay,
+            runs_root    = getattr(self.cfg, "runs_root", "runs"),
+        )
+        log.info(f"Run recorder: {self._recorder.run_dir}")
+
         # Unblock every waiting worker's GetAssignment call
         for w in alive:
             w.assignment_queue.put_nowait(True)
@@ -403,6 +422,11 @@ class LeaderService(trainer_pb2_grpc.TrainerServiceServicer):
             return
 
         self._training_started = asyncio.Event()   # fresh, unset
+
+        if self._recorder is not None:
+            run_dir = self._recorder.close()
+            log.info(f"Run saved to {run_dir}")
+            self._recorder = None
 
         async with self._grad_cond:
             self._pending_grads.clear()
@@ -480,31 +504,17 @@ class LeaderService(trainer_pb2_grpc.TrainerServiceServicer):
     async def _print_status(self) -> None:
         async with self._lock:
             workers = list(self._workers.values())
+            step    = self._global_step
+            epoch   = self._current_epoch
+            loss    = self._global_loss
 
         if not workers:
-            log.info("No workers connected.")
             return
 
-        total = sum(len(w.shard_indices) for w in workers) or 1
-        div   = "─" * 82
-        print(div)
         print(
-            f"  {'ID':<10} {'HOSTNAME':<22} {'SCORE':>8} "
-            f"{'SHARD':>7} {'BATCH':>6}  {'STATUS':<8}  ACCEL"
-        )
-        print(div)
-        for w in workers:
-            pct   = len(w.shard_indices) / total * 100 if w.shard_indices else 0.0
-            alive = "alive" if w.is_alive else "DEAD"
-            print(
-                f"  {w.worker_id:<10} {w.hostname:<22} {w.score:>8.1f} "
-                f"{pct:>6.1f}% {w.local_batch_size:>6}  {alive:<8}  {w.accel_summary}"
-            )
-        print(div)
-        print(
-            f"  Step={self._global_step:>6}  "
-            f"Epoch={self._current_epoch:>3}  "
-            f"Loss={self._global_loss:.4f}  "
+            f"  Step={step:>6}  "
+            f"Epoch={epoch:>3}  "
+            f"Loss={loss:.4f}  "
             f"Workers={len(workers)}"
         )
 
@@ -614,6 +624,7 @@ class LeaderService(trainer_pb2_grpc.TrainerServiceServicer):
                     param.grad.add_(grad, alpha=weight)
 
         self._optimizer.step()
+        old_epoch = self._current_epoch
         self._global_step += 1
 
         losses = [g.loss for g in grads.values() if g.loss > 0]
@@ -645,6 +656,43 @@ class LeaderService(trainer_pb2_grpc.TrainerServiceServicer):
         # Epoch tracking (approximate — assumes all workers finish same #steps)
         steps_per_epoch = max(1, TINY_IMAGENET_TRAIN // (32 * max(1, len(grads))))
         self._current_epoch = self._global_step // steps_per_epoch
+
+        if self._recorder:
+            self._recorder.log_step(self._global_step, self._global_loss)
+
+        if self._current_epoch > old_epoch:
+            val_acc = self._run_val_sync()
+            if self._recorder:
+                self._recorder.log_epoch(self._current_epoch, val_acc)
+
+    # ── Private: validation evaluation (runs in thread pool) ─────────────────
+
+    def _run_val_sync(self) -> float:
+        """Top-1 accuracy on the full Tiny ImageNet-200 val split."""
+        data_root = getattr(self.cfg, "data_root", None)
+        try:
+            loader = make_val_loader(data_root, batch_size=128, cpu_cores=4)
+        except Exception as exc:
+            log.warning(f"Val loader unavailable: {exc}")
+            return 0.0
+
+        self._model.eval()
+        correct = total = 0
+        with torch.no_grad():
+            for images, labels in loader:
+                images = images.to(self._device)
+                labels = labels.to(self._device)
+                preds  = self._model(images).argmax(dim=1)
+                correct += (preds == labels).sum().item()
+                total   += labels.size(0)
+        self._model.train()
+
+        acc = correct / total if total > 0 else 0.0
+        log.info(
+            f"Epoch {self._current_epoch} — val_acc={acc:.4f}  "
+            f"({correct}/{total})"
+        )
+        return acc
 
     # ── Private: weight serialisation ─────────────────────────────────────────
 
@@ -775,17 +823,21 @@ async def main(cfg: argparse.Namespace) -> None:
         try:
             await cli_loop(service)
         finally:
+            if service._recorder is not None:
+                run_dir = service._recorder.close()
+                log.info(f"Run saved to {run_dir}")
             await server.stop(grace=5)
     else:
         # Non-interactive (subprocess / CI / piped stdin): run until killed.
-        # Training starts automatically via --auto-start or when a worker
-        # registers and the min_workers threshold is met.
         log.info("Non-interactive mode — Ctrl-C or SIGTERM to stop.")
         try:
             await server.wait_for_termination()
         except (asyncio.CancelledError, KeyboardInterrupt):
             pass
         finally:
+            if service._recorder is not None:
+                run_dir = service._recorder.close()
+                log.info(f"Run saved to {run_dir}")
             await server.stop(grace=5)
 
 
@@ -814,5 +866,7 @@ if __name__ == "__main__":
     p.add_argument("--grad-sync-timeout", type=float, default=_DEFAULT_GRAD_SYNC_TIMEOUT,
                    dest="grad_sync_timeout",
                    help="Max seconds to wait for all workers per gradient round (default 120)")
+    p.add_argument("--data-root", default=None, dest="data_root",
+                   help="Path to Tiny ImageNet-200 cache (default: ~/.cache/tiny-imagenet-200)")
     cfg = p.parse_args()
     asyncio.run(main(cfg))

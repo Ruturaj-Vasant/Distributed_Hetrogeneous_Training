@@ -16,6 +16,78 @@ What this script does, in order:
             → apply weight delta from leader → repeat
 """
 
+# ── Self-bootstrap: create .venv, install deps, generate proto stubs ──────────
+# Uses only stdlib so this block runs before any third-party imports.
+
+def _bootstrap() -> None:
+    import os, subprocess, sys
+    from pathlib import Path
+
+    proj = Path(__file__).resolve().parent
+    venv = proj / ".venv"
+    is_win = sys.platform == "win32"
+    venv_py = venv / ("Scripts/python.exe" if is_win else "bin/python")
+
+    # Already inside a venv — nothing to do.
+    if sys.prefix != sys.base_prefix:
+        return
+
+    # Create venv if it doesn't exist yet.
+    if not venv_py.exists():
+        print("[bootstrap] Creating .venv …", flush=True)
+        subprocess.run([sys.executable, "-m", "venv", str(venv)], check=True)
+
+    # Install / verify dependencies.
+    probe = subprocess.run(
+        [str(venv_py), "-c", "import torch, torchvision, grpc"],
+        capture_output=True,
+    )
+    if probe.returncode != 0:
+        print("[bootstrap] Installing dependencies …", flush=True)
+        subprocess.run(
+            [str(venv_py), "-m", "pip", "install",
+             "-r", str(proj / "requirements.txt"), "-q"],
+            check=True,
+        )
+
+    # Generate gRPC proto stubs if missing.
+    proto_dir = proj / "proto"
+    if not (proto_dir / "trainer_pb2.py").exists():
+        print("[bootstrap] Generating gRPC proto stubs …", flush=True)
+        subprocess.run(
+            [
+                str(venv_py), "-m", "grpc_tools.protoc",
+                f"--proto_path={proto_dir}",
+                f"--python_out={proto_dir}",
+                f"--grpc_python_out={proto_dir}",
+                str(proto_dir / "trainer.proto"),
+            ],
+            check=True,
+        )
+        grpc_f = proto_dir / "trainer_pb2_grpc.py"
+        if grpc_f.exists():
+            grpc_f.write_text(
+                grpc_f.read_text().replace(
+                    "import trainer_pb2", "from . import trainer_pb2", 1
+                )
+            )
+        init = proto_dir / "__init__.py"
+        if not init.exists():
+            init.write_text("")
+
+    # Re-exec this script inside the venv.
+    print("[bootstrap] Launching inside .venv …", flush=True)
+    if is_win:
+        result = subprocess.run([str(venv_py)] + sys.argv)
+        sys.exit(result.returncode)
+    else:
+        os.execv(str(venv_py), [str(venv_py)] + sys.argv)
+
+
+_bootstrap()
+
+# ── Imports (guaranteed to succeed — either already in venv, or re-exec'd) ───
+
 import argparse
 import asyncio
 import io
@@ -464,7 +536,9 @@ async def run(cfg: argparse.Namespace) -> None:
         log.info("Dry-run mode: skipping dataset download (synthetic data will be used)")
     else:
         log.info("Checking dataset …")
-        await asyncio.get_event_loop().run_in_executor(None, ensure_dataset)
+        await asyncio.get_event_loop().run_in_executor(
+            None, lambda: ensure_dataset(cfg.cache_dir)
+        )
 
     # ── Step 3/4: open gRPC channels and register ─────────────────────────────
     async_ch, async_stub, sync_ch, sync_stub, reg = await _connect_and_register(
@@ -530,7 +604,7 @@ async def run(cfg: argparse.Namespace) -> None:
                 log.info(f"Synthetic DataLoader: {n_synthetic} samples  batch={assignment.local_batch_size}")
             else:
                 loader = make_train_loader(
-                    root       = None,
+                    root       = cfg.cache_dir,
                     indices    = list(assignment.indices),
                     batch_size = assignment.local_batch_size,
                     cpu_cores  = hw.cpu_cores,
@@ -576,9 +650,10 @@ if __name__ == "__main__":
 
     p = argparse.ArgumentParser(description="Distributed ResNet-101 — Worker")
     p.add_argument(
-        "--leader", required=True,
-        help="Leader hostname or Tailscale magic DNS  "
-             "(e.g. leader-macbook-pro.taila5426e.ts.net)"
+        "--leader",
+        default="leader-macbook-pro.taila5426e.ts.net",
+        help="Leader hostname or Tailscale magic DNS "
+             "(default: leader-macbook-pro.taila5426e.ts.net)"
     )
     p.add_argument("--port",  type=int, default=50051)
     p.add_argument(
@@ -610,9 +685,6 @@ if __name__ == "__main__":
         help="Maximum seconds to sleep between connection retries"
     )
     cfg = p.parse_args()
-
-    if cfg.cache_dir:
-        _CACHE_ROOT = Path(cfg.cache_dir)
 
     try:
         asyncio.run(run(cfg))
