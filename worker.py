@@ -17,6 +17,7 @@ What this script does, in order:
 """
 
 import argparse
+import asyncio
 import io
 import logging
 import sys
@@ -84,6 +85,81 @@ def _sync_channel(host: str, port: int) -> grpc.Channel:
 def _async_channel(host: str, port: int) -> aio.Channel:
     """Async channel — used for heartbeat and GetAssignment coroutines."""
     return aio.insecure_channel(f"{host}:{port}", options=_GRPC_OPTIONS)
+
+
+def _rpc_error_summary(exc: BaseException) -> str:
+    if isinstance(exc, grpc.aio.AioRpcError):
+        return f"{exc.code().name}: {exc.details()}"
+    if isinstance(exc, asyncio.TimeoutError):
+        return "timed out waiting for gRPC channel readiness"
+    return f"{type(exc).__name__}: {exc}"
+
+
+async def _connect_and_register(
+    cfg: argparse.Namespace,
+    hw,
+    bm,
+) -> tuple[
+    aio.Channel,
+    trainer_pb2_grpc.TrainerServiceStub,
+    grpc.Channel,
+    trainer_pb2_grpc.TrainerServiceStub,
+    trainer_pb2.RegisterResponse,
+]:
+    """
+    Build fresh channels and register, retrying transient Tailscale/gRPC startup
+    failures instead of crashing the worker on the first unavailable response.
+    """
+    addr = f"{cfg.leader}:{cfg.port}"
+    last_error = "unknown error"
+
+    for attempt in range(1, cfg.connect_retries + 1):
+        async_ch = _async_channel(cfg.leader, cfg.port)
+        async_stub = trainer_pb2_grpc.TrainerServiceStub(async_ch)
+        sync_ch = _sync_channel(cfg.leader, cfg.port)
+        sync_stub = trainer_pb2_grpc.TrainerServiceStub(sync_ch)
+
+        try:
+            log.info(
+                f"Connecting to leader at {addr} "
+                f"(attempt {attempt}/{cfg.connect_retries}) …"
+            )
+            await asyncio.wait_for(
+                async_ch.channel_ready(),
+                timeout=cfg.connect_timeout,
+            )
+            reg = await async_stub.Register(
+                trainer_pb2.RegisterRequest(
+                    hw_info=_hw_to_proto(hw),
+                    benchmark=trainer_pb2.BenchmarkResult(
+                        score=bm.score,
+                        forward_ms=bm.forward_ms,
+                        memory_free_gb=bm.memory_free_gb,
+                    ),
+                ),
+                timeout=cfg.rpc_timeout,
+                wait_for_ready=True,
+            )
+            return async_ch, async_stub, sync_ch, sync_stub, reg
+        except (asyncio.TimeoutError, grpc.aio.AioRpcError) as exc:
+            last_error = _rpc_error_summary(exc)
+            await async_ch.close()
+            sync_ch.close()
+
+            if attempt >= cfg.connect_retries:
+                break
+
+            delay = min(cfg.retry_backoff * attempt, cfg.max_retry_backoff)
+            log.warning(
+                f"Leader connection failed: {last_error}; "
+                f"retrying in {delay:.1f}s"
+            )
+            await asyncio.sleep(delay)
+
+    raise RuntimeError(
+        f"Could not register with leader at {addr} after "
+        f"{cfg.connect_retries} attempt(s): {last_error}"
+    )
 
 
 # ── Gradient compression ──────────────────────────────────────────────────────
@@ -372,8 +448,6 @@ def _resolve_device(suggested: str) -> torch.device:
 # ── Main entry point ──────────────────────────────────────────────────────────
 
 async def run(cfg: argparse.Namespace) -> None:
-    import asyncio
-
     # ── Step 1: hardware probe ────────────────────────────────────────────────
     log.info("Probing hardware …")
     hw_result = probe()
@@ -392,32 +466,14 @@ async def run(cfg: argparse.Namespace) -> None:
         log.info("Checking dataset …")
         await asyncio.get_event_loop().run_in_executor(None, ensure_dataset)
 
-    # ── Step 3: open gRPC channels ────────────────────────────────────────────
-    addr = f"{cfg.leader}:{cfg.port}"
-    log.info(f"Connecting to leader at {addr} …")
-
-    # Async channel: heartbeat (bidi stream) + GetAssignment
-    async_ch  = _async_channel(cfg.leader, cfg.port)
-    async_stub = trainer_pb2_grpc.TrainerServiceStub(async_ch)
-
-    # Sync channel: ExchangeGradients (called from training thread)
-    sync_ch   = _sync_channel(cfg.leader, cfg.port)
-    sync_stub = trainer_pb2_grpc.TrainerServiceStub(sync_ch)
-
-    # ── Step 4: register ──────────────────────────────────────────────────────
-    reg = await async_stub.Register(
-        trainer_pb2.RegisterRequest(
-            hw_info   = _hw_to_proto(hw),
-            benchmark = trainer_pb2.BenchmarkResult(
-                score          = bm.score,
-                forward_ms     = bm.forward_ms,
-                memory_free_gb = bm.memory_free_gb,
-            ),
-        )
+    # ── Step 3/4: open gRPC channels and register ─────────────────────────────
+    async_ch, async_stub, sync_ch, sync_stub, reg = await _connect_and_register(
+        cfg, hw, bm
     )
     if not reg.accepted:
         log.error(f"Registration rejected: {reg.reject_reason}")
         await async_ch.close()
+        sync_ch.close()
         return
 
     worker_id = reg.worker_id
@@ -519,6 +575,26 @@ if __name__ == "__main__":
         "--dry-run", action="store_true", dest="dry_run",
         help="Skip dataset download and use synthetic tensors — useful for protocol testing"
     )
+    p.add_argument(
+        "--connect-timeout", type=float, default=20.0, dest="connect_timeout",
+        help="Seconds to wait for the gRPC channel to become ready per attempt"
+    )
+    p.add_argument(
+        "--rpc-timeout", type=float, default=30.0, dest="rpc_timeout",
+        help="Seconds to wait for registration RPC completion"
+    )
+    p.add_argument(
+        "--connect-retries", type=int, default=6, dest="connect_retries",
+        help="Number of leader connection/registration attempts before failing"
+    )
+    p.add_argument(
+        "--retry-backoff", type=float, default=2.0, dest="retry_backoff",
+        help="Base seconds between retries; multiplied by attempt number"
+    )
+    p.add_argument(
+        "--max-retry-backoff", type=float, default=15.0, dest="max_retry_backoff",
+        help="Maximum seconds to sleep between connection retries"
+    )
     cfg = p.parse_args()
 
     if cfg.cache_dir:
@@ -529,3 +605,6 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         log.info("Interrupted by user.")
         sys.exit(0)
+    except RuntimeError as exc:
+        log.error(str(exc))
+        sys.exit(1)

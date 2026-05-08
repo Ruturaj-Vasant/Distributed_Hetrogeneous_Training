@@ -21,6 +21,8 @@ import argparse
 import asyncio
 import io
 import logging
+import os
+import signal
 import sys
 import time
 import uuid
@@ -622,14 +624,59 @@ async def cli_loop(service: LeaderService) -> None:
             print("  Try: start | status | quit")
 
 
+# ── Port conflict guard ───────────────────────────────────────────────────────
+
+def _kill_existing_leader(port: int) -> None:
+    """
+    Find and kill any process already listening on *port* so that only one
+    leader can own the port at a time.  Uses lsof (available on macOS/Linux).
+    Silently does nothing on Windows or if lsof is not found.
+    """
+    import subprocess, shutil
+    if not shutil.which("lsof"):
+        return
+    try:
+        out = subprocess.check_output(
+            ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except subprocess.CalledProcessError:
+        return  # no process found on that port
+
+    killed = []
+    for line in out.splitlines()[1:]:   # skip header
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        try:
+            pid = int(parts[1])
+        except ValueError:
+            continue
+        if pid == os.getpid():
+            continue                    # don't kill ourselves
+        try:
+            os.kill(pid, signal.SIGTERM)
+            killed.append(pid)
+        except ProcessLookupError:
+            pass
+
+    if killed:
+        log.info(f"Stopped existing leader process(es) on port {port}: {killed}")
+        time.sleep(0.5)                 # brief pause so the port is released
+
+
 # ── Server startup ────────────────────────────────────────────────────────────
 
 async def main(cfg: argparse.Namespace) -> None:
+    _kill_existing_leader(cfg.port)
+
     service = LeaderService(cfg)
     _MB = 1024 * 1024
     server  = aio.server(options=[
         ("grpc.max_receive_message_length", 256 * _MB),
         ("grpc.max_send_message_length",    256 * _MB),
+        ("grpc.so_reuseport", 0),
     ])
     trainer_pb2_grpc.add_TrainerServiceServicer_to_server(service, server)
 
