@@ -97,6 +97,7 @@ _bootstrap()
 
 # ── Imports (guaranteed to succeed — either already in venv, or re-exec'd) ───
 
+from __future__ import annotations
 import argparse
 import asyncio
 import io

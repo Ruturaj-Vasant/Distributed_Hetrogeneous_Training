@@ -17,6 +17,7 @@ Worker flow (handled here):
     5. Leader aggregates (weighted by batch count), returns weight delta
 """
 
+from __future__ import annotations
 import argparse
 import asyncio
 import io
@@ -113,6 +114,10 @@ class LeaderService(trainer_pb2_grpc.TrainerServiceServicer):
 
         # Run recorder (created at training start, closed on reset)
         self._recorder: Optional[RunRecorder] = None
+
+        # Gradient numel — populated by _init_model()
+        self._raw_gradient_numel:        int = 0
+        self._compressed_gradient_numel: int = 0
 
         # Gradient synchronisation across workers
         # asyncio.Condition protects _pending_grads and _grad_round.
@@ -393,16 +398,22 @@ class LeaderService(trainer_pb2_grpc.TrainerServiceServicer):
         self._training_started.set()
 
         # Create run recorder
-        topk_k = getattr(self.cfg, "topk", 0)
+        topk_k     = getattr(self.cfg, "topk", 0)
+        world_size = len(alive)
         self._recorder = RunRecorder(
-            model_name   = getattr(self.cfg, "model_name", "resnet101"),
-            dataset      = "tinyimagenet200",
-            optimizer    = "sgd",
-            topk_k       = topk_k,
-            epochs       = self.cfg.epochs,
-            lr           = self.cfg.lr,
-            weight_decay = self.cfg.weight_decay,
-            runs_root    = getattr(self.cfg, "runs_root", "runs"),
+            model_name                = getattr(self.cfg, "model_name", "resnet101"),
+            dataset                   = "tinyimagenet200",
+            optimizer                 = "sgd",
+            topk_k                    = topk_k,
+            epochs                    = self.cfg.epochs,
+            lr                        = self.cfg.lr,
+            weight_decay              = self.cfg.weight_decay,
+            batch_size                = getattr(self.cfg, "batch_size", 32),
+            world_size                = world_size,
+            dataset_samples           = TINY_IMAGENET_TRAIN,
+            raw_gradient_numel        = self._raw_gradient_numel,
+            compressed_gradient_numel = self._compressed_gradient_numel,
+            runs_root                 = getattr(self.cfg, "runs_root", "runs"),
         )
         log.info(f"Run recorder: {self._recorder.run_dir}")
 
@@ -614,6 +625,19 @@ class LeaderService(trainer_pb2_grpc.TrainerServiceServicer):
         name = getattr(self.cfg, "model_name", "resnet101")
         log.info(f"{name} on {self._device}  ({mb:.0f} MB params)")
 
+        # Gradient element counts for compression tracking
+        self._raw_gradient_numel = sum(
+            p.numel() for p in self._model.parameters() if p.requires_grad
+        )
+        topk_k = getattr(self.cfg, "topk", 0)
+        if topk_k > 0:
+            num_grad_layers = sum(
+                1 for p in self._model.parameters() if p.requires_grad
+            )
+            self._compressed_gradient_numel = topk_k * num_grad_layers
+        else:
+            self._compressed_gradient_numel = self._raw_gradient_numel
+
     # ── Private: gradient aggregation + optimizer step ────────────────────────
 
     def _aggregate_and_step(self) -> None:
@@ -690,7 +714,8 @@ class LeaderService(trainer_pb2_grpc.TrainerServiceServicer):
             hostname   = self._workers[wid].hostname if wid in self._workers else wid
             latency_parts.append((hostname, compute_ms, wait_ms))
 
-        round_ms = (round_end - min(arrivals.values())) * 1000 if arrivals else 0.0
+        round_ms          = (round_end - min(arrivals.values())) * 1000 if arrivals else 0.0
+        straggler_delay_s = (max_wait_ms / 1000.0) if len(arrivals) > 1 else 0.0
 
         if self._global_step % 10 == 0 or len(arrivals) > 1:
             parts_str = "  ".join(
@@ -709,7 +734,9 @@ class LeaderService(trainer_pb2_grpc.TrainerServiceServicer):
         self._current_epoch = self._global_step // steps_per_epoch
 
         if self._recorder:
-            self._recorder.log_step(self._global_step, self._global_loss, round_ms)
+            self._recorder.log_step(
+                self._global_step, self._global_loss, round_ms, straggler_delay_s
+            )
 
         if self._current_epoch > old_epoch:
             val_acc = self._run_val_sync()

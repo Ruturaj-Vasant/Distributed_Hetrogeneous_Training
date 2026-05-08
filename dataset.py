@@ -7,6 +7,7 @@ integrity verification, and DataLoader construction for both train and val split
 Can be run standalone to pre-download the dataset before training:
     python3 dataset.py [--root ~/.cache/tiny-imagenet-200]
 """
+from __future__ import annotations
 
 import argparse
 import shutil
