@@ -32,7 +32,7 @@ from grpc import aio
 
 from proto import trainer_pb2, trainer_pb2_grpc
 from hardware_probe import probe, AccelType
-from dataset import ensure_dataset, make_train_loader
+from dataset import ensure_dataset, make_train_loader, IMG_SIZE, NUM_CLASSES
 
 logging.basicConfig(
     level=logging.INFO,
@@ -40,6 +40,31 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("worker")
+
+
+# ── Synthetic dataloader (dry-run / testing) ──────────────────────────────────
+
+class _SyntheticDataset(torch.utils.data.Dataset):
+    """Random tensors that look like Tiny ImageNet batches — no disk I/O."""
+    def __init__(self, n: int, num_classes: int) -> None:
+        self.n = n
+        self.num_classes = num_classes
+
+    def __len__(self) -> int:
+        return self.n
+
+    def __getitem__(self, idx: int):
+        return (
+            torch.randn(3, IMG_SIZE, IMG_SIZE),
+            torch.randint(0, self.num_classes, (1,)).item(),
+        )
+
+
+def _make_synthetic_loader(n: int, batch_size: int, num_classes: int) -> torch.utils.data.DataLoader:
+    ds = _SyntheticDataset(n, num_classes)
+    return torch.utils.data.DataLoader(
+        ds, batch_size=batch_size, shuffle=True, drop_last=True, num_workers=0
+    )
 
 
 # ── gRPC channel helpers ──────────────────────────────────────────────────────
@@ -357,10 +382,11 @@ async def run(cfg: argparse.Namespace) -> None:
     )
 
     # ── Step 2: dataset download ──────────────────────────────────────────────
-    log.info("Checking dataset …")
-    train_dir = await asyncio.get_event_loop().run_in_executor(
-        None, ensure_dataset
-    )
+    if cfg.dry_run:
+        log.info("Dry-run mode: skipping dataset download (synthetic data will be used)")
+    else:
+        log.info("Checking dataset …")
+        await asyncio.get_event_loop().run_in_executor(None, ensure_dataset)
 
     # ── Step 3: open gRPC channels ────────────────────────────────────────────
     addr = f"{cfg.leader}:{cfg.port}"
@@ -419,18 +445,29 @@ async def run(cfg: argparse.Namespace) -> None:
     )
 
     # ── Step 7: build model + load initial weights ────────────────────────────
-    log.info(f"Building ResNet-101 ({config.num_classes} classes) on {device} …")
-    model = models.resnet101(weights=None, num_classes=config.num_classes)
+    _MODEL_FNS = {
+        "resnet18":  models.resnet18,
+        "resnet50":  models.resnet50,
+        "resnet101": models.resnet101,
+    }
+    model_fn = _MODEL_FNS.get(config.model_name, models.resnet101)
+    log.info(f"Building {config.model_name} ({config.num_classes} classes) on {device} …")
+    model = model_fn(weights=None, num_classes=config.num_classes)
     load_full_weights(model, assignment_resp.model_weights, device)
     model = model.to(device).train()
 
     # ── Step 8: build dataloader for this worker's shard ──────────────────────
-    loader = make_train_loader(
-        root       = None,
-        indices    = list(assignment.indices),
-        batch_size = assignment.local_batch_size,
-        cpu_cores  = hw.cpu_cores,
-    )
+    if cfg.dry_run:
+        n_synthetic = min(len(assignment.indices), 320)   # enough for ~10 batches
+        loader = _make_synthetic_loader(n_synthetic, assignment.local_batch_size, config.num_classes)
+        log.info(f"Synthetic DataLoader: {n_synthetic} samples  batch={assignment.local_batch_size}")
+    else:
+        loader = make_train_loader(
+            root       = None,
+            indices    = list(assignment.indices),
+            batch_size = assignment.local_batch_size,
+            cpu_cores  = hw.cpu_cores,
+        )
     log.info(
         f"DataLoader ready:  {len(loader.dataset):,} samples  "
         f"batch={assignment.local_batch_size}  "
@@ -473,6 +510,10 @@ if __name__ == "__main__":
     p.add_argument(
         "--cache-dir", default=None, dest="cache_dir",
         help="Override dataset cache directory (default: ~/.cache/tiny-imagenet-200)"
+    )
+    p.add_argument(
+        "--dry-run", action="store_true", dest="dry_run",
+        help="Skip dataset download and use synthetic tensors — useful for protocol testing"
     )
     cfg = p.parse_args()
 

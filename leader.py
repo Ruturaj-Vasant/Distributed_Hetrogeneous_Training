@@ -626,7 +626,11 @@ async def cli_loop(service: LeaderService) -> None:
 
 async def main(cfg: argparse.Namespace) -> None:
     service = LeaderService(cfg)
-    server  = aio.server()
+    _MB = 1024 * 1024
+    server  = aio.server(options=[
+        ("grpc.max_receive_message_length", 256 * _MB),
+        ("grpc.max_send_message_length",    256 * _MB),
+    ])
     trainer_pb2_grpc.add_TrainerServiceServicer_to_server(service, server)
 
     listen_addr = f"0.0.0.0:{cfg.port}"
@@ -642,10 +646,23 @@ async def main(cfg: argparse.Namespace) -> None:
     asyncio.create_task(service.heartbeat_monitor())
     asyncio.create_task(service.status_printer())
 
-    try:
-        await cli_loop(service)
-    finally:
-        await server.stop(grace=5)
+    if sys.stdin.isatty():
+        # Interactive terminal: show CLI prompt
+        try:
+            await cli_loop(service)
+        finally:
+            await server.stop(grace=5)
+    else:
+        # Non-interactive (subprocess / CI / piped stdin): run until killed.
+        # Training starts automatically via --auto-start or when a worker
+        # registers and the min_workers threshold is met.
+        log.info("Non-interactive mode — Ctrl-C or SIGTERM to stop.")
+        try:
+            await server.wait_for_termination()
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            pass
+        finally:
+            await server.stop(grace=5)
 
 
 if __name__ == "__main__":
