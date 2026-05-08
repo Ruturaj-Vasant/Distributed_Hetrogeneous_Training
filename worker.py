@@ -115,7 +115,10 @@ from grpc import aio
 
 from proto import trainer_pb2, trainer_pb2_grpc
 from hardware_probe import probe, AccelType
-from dataset import ensure_dataset, make_train_loader, IMG_SIZE, NUM_CLASSES
+from dataset import (
+    ensure_any_dataset, make_any_train_loader, get_dataset_info,
+    IMG_SIZE, NUM_CLASSES,  # fallback defaults for synthetic loader
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -333,6 +336,12 @@ class WorkerSharedState:
         self.paused:              bool  = False
         self.stop:                bool  = False  # set on any halt condition
         self.leader_disconnected: bool  = False  # True = connection loss, False = explicit STOP
+        # Set by heartbeat_loop when leader sends RESHARD; cleared by run() after reload
+        self.reshard_indices:    Optional[list] = None
+        self.reshard_batch_size: int            = 0
+        # Tracks the epoch we are currently in (or just finished); used to continue
+        # from the right epoch after a reshard rather than restarting from epoch 0.
+        self.epoch_completed:    int            = 0
 
 
 # ── Heartbeat coroutine (runs in asyncio) ─────────────────────────────────────
@@ -374,6 +383,15 @@ async def heartbeat_loop(
                 if shared.paused:
                     log.info("Leader sent CONTINUE — resuming.")
                 shared.paused = False
+            elif cmd == trainer_pb2.HeartbeatResponse.RESHARD:
+                ns = resp.new_shard
+                log.info(
+                    f"Leader sent RESHARD — "
+                    f"{len(ns.indices):,} new samples  batch={ns.local_batch_size}"
+                )
+                shared.reshard_indices   = list(ns.indices)
+                shared.reshard_batch_size = ns.local_batch_size
+                shared.stop = True
     except _asyncio.CancelledError:
         pass
     except Exception as e:
@@ -385,13 +403,14 @@ async def heartbeat_loop(
 # ── Training loop (runs in a thread, uses sync gRPC) ─────────────────────────
 
 def training_loop(
-    model:      nn.Module,
-    loader:     torch.utils.data.DataLoader,
-    sync_stub:  trainer_pb2_grpc.TrainerServiceStub,   # sync stub
-    worker_id:  str,
-    config:     trainer_pb2.TrainingConfig,
-    device:     torch.device,
-    shared:     WorkerSharedState,
+    model:       nn.Module,
+    loader:      torch.utils.data.DataLoader,
+    sync_stub:   trainer_pb2_grpc.TrainerServiceStub,   # sync stub
+    worker_id:   str,
+    config:      trainer_pb2.TrainingConfig,
+    device:      torch.device,
+    shared:      WorkerSharedState,
+    start_epoch: int = 0,
 ) -> None:
     """
     Synchronous training loop.  Runs in a thread pool so asyncio stays free.
@@ -415,7 +434,8 @@ def training_loop(
         f"topk_k={topk_k}  grad_accum={grad_accum}  device={device}"
     )
 
-    for epoch in range(epochs):
+    for epoch in range(start_epoch, epochs):
+        shared.epoch_completed = epoch  # mark which epoch we're in (for reshard restart)
         shared.status = trainer_pb2.TRAINING
         epoch_losses: list[float] = []
 
@@ -502,6 +522,7 @@ def training_loop(
             accum_count   = 0
 
         avg_loss = sum(epoch_losses) / len(epoch_losses) if epoch_losses else 0.0
+        shared.epoch_completed = epoch + 1  # epoch fully finished
         log.info(f"Epoch {epoch + 1}/{epochs} done  avg_loss={avg_loss:.4f}")
 
     shared.status = trainer_pb2.IDLE
@@ -572,14 +593,12 @@ async def run(cfg: argparse.Namespace) -> None:
         f"FreeMem={bm.memory_free_gb:.1f}GB"
     )
 
-    # ── Step 2: dataset download ──────────────────────────────────────────────
+    # ── Step 2: dataset download ─────────────────────────────────────────────
+    # The actual dataset name comes from the leader's TrainingConfig, so we
+    # defer the real download until after GetAssignment.  Pre-flight check
+    # only happens in non-dry-run, post-assignment (see Step 8 below).
     if cfg.dry_run:
         log.info("Dry-run mode: skipping dataset download (synthetic data will be used)")
-    else:
-        log.info("Checking dataset …")
-        await asyncio.get_event_loop().run_in_executor(
-            None, lambda: ensure_dataset(cfg.cache_dir)
-        )
 
     _MODEL_FNS = {
         "resnet18":  models.resnet18,
@@ -651,7 +670,9 @@ async def run(cfg: argparse.Namespace) -> None:
                 model = model.to(device).train()
 
                 # Step 8: build dataloader
+                dataset_name = config.dataset or "tinyimagenet"
                 if cfg.dry_run:
+                    ds_info     = get_dataset_info(dataset_name)
                     n_synthetic = min(len(assignment.indices), 320)
                     loader = _make_synthetic_loader(
                         n_synthetic, assignment.local_batch_size, config.num_classes
@@ -661,7 +682,12 @@ async def run(cfg: argparse.Namespace) -> None:
                         f"batch={assignment.local_batch_size}"
                     )
                 else:
-                    loader = make_train_loader(
+                    log.info(f"Ensuring {dataset_name} dataset …")
+                    await asyncio.get_event_loop().run_in_executor(
+                        None, lambda: ensure_any_dataset(dataset_name, cfg.cache_dir)
+                    )
+                    loader = make_any_train_loader(
+                        dataset    = dataset_name,
                         root       = cfg.cache_dir,
                         indices    = list(assignment.indices),
                         batch_size = assignment.local_batch_size,
@@ -673,14 +699,46 @@ async def run(cfg: argparse.Namespace) -> None:
                     f"batches/epoch={len(loader)}"
                 )
 
-                # Step 9: training loop in thread pool
-                await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    lambda: training_loop(
-                        model, loader, sync_stub,
-                        worker_id, config, device, shared,
-                    ),
-                )
+                # Step 9: training loop — with reshard loop so the worker can
+                # reload a new shard mid-training without losing its connection.
+                while True:
+                    await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: training_loop(
+                            model, loader, sync_stub,
+                            worker_id, config, device, shared,
+                            start_epoch=shared.epoch_completed,
+                        ),
+                    )
+
+                    # Leader sent a RESHARD command while we were training.
+                    if shared.reshard_indices is not None:
+                        new_indices    = shared.reshard_indices
+                        new_batch_size = shared.reshard_batch_size
+                        shared.reshard_indices   = None
+                        shared.reshard_batch_size = 0
+                        shared.stop              = False
+                        log.info(
+                            f"Resharding: {len(new_indices):,} new samples  "
+                            f"batch={new_batch_size}  "
+                            f"continuing from epoch {shared.epoch_completed}"
+                        )
+                        if cfg.dry_run:
+                            n_synthetic = min(len(new_indices), 320)
+                            loader = _make_synthetic_loader(
+                                n_synthetic, new_batch_size, config.num_classes
+                            )
+                        else:
+                            loader = make_any_train_loader(
+                                dataset    = dataset_name,
+                                root       = cfg.cache_dir,
+                                indices    = new_indices,
+                                batch_size = new_batch_size,
+                                cpu_cores  = hw.cpu_cores,
+                            )
+                        continue  # re-enter training_loop with new loader
+
+                    break  # no reshard — training finished normally or via STOP
 
                 if shared.stop:
                     if shared.leader_disconnected:

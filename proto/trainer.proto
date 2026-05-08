@@ -74,12 +74,13 @@ message HeartbeatRequest {
 
 message HeartbeatResponse {
   enum LeaderCommand {
-    CONTINUE    = 0;
-    PAUSE       = 1;
-    STOP        = 2;
-    RECONFIGURE = 3;  // leader will follow up with a new ShardAssignment
+    CONTINUE = 0;
+    PAUSE    = 1;
+    STOP     = 2;
+    RESHARD  = 3;  // leader sends updated shard in new_shard field
   }
-  LeaderCommand command = 1;
+  LeaderCommand   command   = 1;
+  ShardAssignment new_shard = 2;  // populated when command == RESHARD
 }
 
 // ─────────────────────────────────────────────
@@ -176,11 +177,12 @@ message AdmitWorkersResponse {
 }
 
 message ClusterStatusResponse {
-  repeated WorkerSummary    workers         = 1;
-  int64                     global_step     = 2;
-  float                     global_loss     = 3;
-  int32                     current_epoch   = 4;
+  repeated WorkerSummary    workers          = 1;
+  int64                     global_step      = 2;
+  float                     global_loss      = 3;
+  int32                     current_epoch    = 4;
   repeated PendingWorkerInfo pending_workers = 5;
+  bool                      training_started = 6;
 }
 
 // ─────────────────────────────────────────────

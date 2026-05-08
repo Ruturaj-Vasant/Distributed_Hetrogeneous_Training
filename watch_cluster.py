@@ -59,10 +59,16 @@ def _status_table(resp) -> str:
     return "\n".join(lines)
 
 
-def _pending_table(pending) -> str:
+def _pending_table(pending, training_started: bool) -> str:
     if not pending:
         return ""
-    lines = ["", f"  {'PENDING WORKERS — awaiting admission':^86}", _DIV]
+    if training_started:
+        header = "PENDING WORKERS — admit to trigger Phase-2 shard rebalancing"
+        footer = f"  admit all  |  admit {pending[0].worker_id}  (triggers reshard on active workers)"
+    else:
+        header = "PENDING WORKERS — admit the ones you want, then type 'start' on leader"
+        footer = f"  admit all  |  admit {pending[0].worker_id}  (admitted workers join at 'start')"
+    lines = ["", f"  {header:^86}", _DIV]
     lines.append(
         f"  {'ID':<10} {'HOSTNAME':<28} {'SCORE':>8} {'WAITING':>9}  ACCEL"
     )
@@ -73,8 +79,7 @@ def _pending_table(pending) -> str:
             f"  {w.worker_id:<10} {w.hostname:<28} {w.score:>8.1f} {wait:>9}  {w.accel_summary}"
         )
     lines.append(_DIV)
-    ids = " ".join(w.worker_id for w in pending)
-    lines.append(f"  To admit: admit all  |  admit {pending[0].worker_id}  ...")
+    lines.append(f"  {footer}")
     return "\n".join(lines)
 
 
@@ -141,7 +146,7 @@ def main() -> None:
             print(f"  Cluster  [{time.strftime('%H:%M:%S')}]  {addr}\n")
             print(_status_table(resp))
             if resp.pending_workers:
-                print(_pending_table(resp.pending_workers))
+                print(_pending_table(resp.pending_workers, resp.training_started))
         except grpc.RpcError as e:
             _clear()
             print(f"  [{time.strftime('%H:%M:%S')}] Leader unreachable: {e.code().name}")

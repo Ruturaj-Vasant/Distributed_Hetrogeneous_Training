@@ -414,6 +414,10 @@ async def test_late_registration_accepted(port: int) -> None:
         _check("T10c shard empty until admitted",
                service._workers[wid].shard_indices == [],
                "shard should be empty before admission")
+        # Record existing worker's original shard size (should be ~100k)
+        first_wid     = next(w for w in service._workers if w != wid)
+        original_size = len(service._workers[first_wid].shard_indices)
+
         # Now admit and verify shard is assigned
         await service.AdmitWorkers(
             trainer_pb2.AdmitWorkersRequest(worker_ids=[wid]), context=None
@@ -421,6 +425,16 @@ async def test_late_registration_accepted(port: int) -> None:
         _check("T10d shard assigned after admit",
                service._workers[wid].shard_indices != [],
                "shard still empty after admit")
+
+        # Phase 2: existing worker must have been resharded (smaller shard + RESHARD queued)
+        first_w       = service._workers[first_wid]
+        new_size      = len(first_w.shard_indices)
+        _check("T10e existing worker shard reduced after Phase-2 rebalance",
+               new_size < original_size,
+               f"shard size: {original_size} → {new_size}")
+        _check("T10f existing worker temporarily unassigned during reshard",
+               not first_w.assigned or first_w.pending_reshard is None,
+               "worker should be excluded from grad rounds or have pending reshard")
     finally:
         await server.stop(grace=1)
 

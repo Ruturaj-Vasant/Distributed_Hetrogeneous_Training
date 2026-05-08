@@ -36,7 +36,7 @@ import torchvision.models as models
 import grpc
 from grpc import aio
 
-from dataset import make_val_loader
+from dataset import make_any_val_loader, get_dataset_info
 from proto import trainer_pb2, trainer_pb2_grpc
 from run_recorder import RunRecorder
 
@@ -50,7 +50,7 @@ log = logging.getLogger("leader")
 # ── Tunables ──────────────────────────────────────────────────────────────────
 
 STATUS_INTERVAL     = 10.0      # seconds between auto-printed cluster tables
-TINY_IMAGENET_TRAIN = 100_000   # total training samples in Tiny ImageNet-200
+TINY_IMAGENET_TRAIN = 100_000   # kept for backwards-compat; use _train_samples at runtime
 # Heartbeat / grad-sync defaults — overridden by CLI flags at runtime
 _DEFAULT_HEARTBEAT_TIMEOUT       = 60.0
 _DEFAULT_HEARTBEAT_CHECK_INTERVAL =  5.0
@@ -81,6 +81,10 @@ class WorkerState:
     # Queue-based assignment: leader puts a sentinel per training run;
     # worker's GetAssignment call blocks on get() and works across resets.
     assignment_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
+
+    # Populated by _assign_late_worker before queuing RESHARD command;
+    # read and cleared inside the Heartbeat handler when building the response.
+    pending_reshard: Optional[trainer_pb2.ShardAssignment] = None
 
     @property
     def is_alive(self) -> bool:
@@ -114,6 +118,11 @@ class LeaderService(trainer_pb2_grpc.TrainerServiceServicer):
 
         # Run recorder (created at training start, closed on reset)
         self._recorder: Optional[RunRecorder] = None
+
+        # Dataset info — resolved from cfg.dataset at training start
+        _ds = get_dataset_info(getattr(cfg, "dataset", "tinyimagenet"))
+        self._train_samples: int = _ds["train_samples"]
+        self._num_classes:   int = _ds["num_classes"]
 
         # Gradient numel — populated by _init_model()
         self._raw_gradient_numel:        int = 0
@@ -174,19 +183,35 @@ class LeaderService(trainer_pb2_grpc.TrainerServiceServicer):
             f"score={bm.score:>8.1f}  bench={bm.forward_ms:.1f}ms  {accel_summary}"
         )
 
+        # All workers always enter the pending pool first.
+        # In auto-start mode they are immediately admitted; otherwise the
+        # operator must run 'admit' before typing 'start'.
+        self._pending_worker_ids.add(wid)
+
         if self._training_started.is_set():
-            # Hold in pending pool — operator admits via watch.py / 'admit' command.
-            self._pending_worker_ids.add(wid)
             log.info(
-                f"[pending] {wid} ({hw.hostname}) waiting for admission. "
-                f"Use 'admit {wid}' or 'admit all' in watch.py."
+                f"[pending] {wid} ({hw.hostname}) — training running, "
+                f"use 'admit {wid}' in watch.py (triggers Phase-2 reshard)."
             )
+        elif self.cfg.auto_start:
+            # Auto mode: admit immediately, then check threshold.
+            self._pending_worker_ids.discard(wid)
+            async with self._lock:
+                n_admitted = sum(
+                    1 for w in self._workers.values()
+                    if w.is_alive and w.worker_id not in self._pending_worker_ids
+                )
+            log.info(
+                f"[auto-admitted] {wid} ({hw.hostname})  "
+                f"{n_admitted}/{self.cfg.min_workers} workers ready"
+            )
+            if n_admitted >= self.cfg.min_workers:
+                asyncio.create_task(self.start_training())
         else:
-            # Auto-start once threshold is met (if flag is set)
-            if self.cfg.auto_start:
-                alive = await self._count_alive()
-                if alive >= self.cfg.min_workers:
-                    asyncio.create_task(self.start_training())
+            log.info(
+                f"[pending] {wid} ({hw.hostname}) — "
+                f"use 'admit {wid}' or 'admit all', then 'start'."
+            )
 
         return trainer_pb2.RegisterResponse(worker_id=wid, accepted=True)
 
@@ -210,12 +235,18 @@ class LeaderService(trainer_pb2_grpc.TrainerServiceServicer):
                 w.status         = req.status
 
                 # Drain one queued command (CONTINUE if nothing pending)
+                cmd = trainer_pb2.HeartbeatResponse.CONTINUE
                 try:
                     cmd = w.cmd_queue.get_nowait()
                 except asyncio.QueueEmpty:
-                    cmd = trainer_pb2.HeartbeatResponse.CONTINUE
+                    pass
 
-                yield trainer_pb2.HeartbeatResponse(command=cmd)
+                if cmd == trainer_pb2.HeartbeatResponse.RESHARD and w.pending_reshard:
+                    new_shard       = w.pending_reshard
+                    w.pending_reshard = None
+                    yield trainer_pb2.HeartbeatResponse(command=cmd, new_shard=new_shard)
+                else:
+                    yield trainer_pb2.HeartbeatResponse(command=cmd)
 
         except grpc.RpcError:
             pass
@@ -296,12 +327,18 @@ class LeaderService(trainer_pb2_grpc.TrainerServiceServicer):
         """
         wid = request.worker_id
 
-        # Gradient push proves the worker is alive — refresh liveness timestamp
-        # so a slow training step doesn't trigger a false heartbeat timeout.
+        # Gradient push proves the worker is alive — refresh liveness timestamp.
+        # Also re-admit a worker that just finished rebuilding its loader after a reshard.
         async with self._lock:
             w = self._workers.get(wid)
             if w is not None:
                 w.last_heartbeat = time.monotonic()
+                if not w.assigned and w.is_alive:
+                    w.assigned = True
+                    log.info(
+                        f"[reshard-done] {wid} ({w.hostname}) "
+                        "rejoined gradient rounds"
+                    )
 
         round_before = self._grad_round
 
@@ -372,11 +409,12 @@ class LeaderService(trainer_pb2_grpc.TrainerServiceServicer):
         ]
 
         return trainer_pb2.ClusterStatusResponse(
-            workers         = summaries,
-            global_step     = self._global_step,
-            global_loss     = self._global_loss,
-            current_epoch   = self._current_epoch,
-            pending_workers = pending,
+            workers          = summaries,
+            global_step      = self._global_step,
+            global_loss      = self._global_loss,
+            current_epoch    = self._current_epoch,
+            pending_workers  = pending,
+            training_started = self._training_started.is_set(),
         )
 
     # ── RPC: AdmitWorkers ─────────────────────────────────────────────────────
@@ -386,13 +424,6 @@ class LeaderService(trainer_pb2_grpc.TrainerServiceServicer):
         request: trainer_pb2.AdmitWorkersRequest,
         context,
     ) -> trainer_pb2.AdmitWorkersResponse:
-        if not self._training_started.is_set():
-            await context.abort(
-                grpc.StatusCode.FAILED_PRECONDITION,
-                "Training has not started — workers will be admitted automatically at start.",
-            )
-            return
-
         ids_to_admit = list(request.worker_ids) or list(self._pending_worker_ids)
         admitted, not_found = [], []
 
@@ -406,10 +437,21 @@ class LeaderService(trainer_pb2_grpc.TrainerServiceServicer):
                 self._pending_worker_ids.discard(wid)
                 not_found.append(wid)
                 continue
-            await self._assign_late_worker(w)
+
+            if self._training_started.is_set():
+                # Mid-training: Phase-2 full shard rebalancing.
+                await self._assign_late_worker(w)
+                log.info(f"[admit] {wid} ({w.hostname}) admitted — Phase-2 reshard triggered.")
+            else:
+                # Pre-training: just move out of the pending pool.
+                # The worker will get its shard when 'start' is typed.
+                log.info(
+                    f"[admit] {wid} ({w.hostname}) admitted — "
+                    "will join at next 'start'."
+                )
+
             self._pending_worker_ids.discard(wid)
             admitted.append(wid)
-            log.info(f"[admit] {wid} ({w.hostname}) admitted to running training.")
 
         return trainer_pb2.AdmitWorkersResponse(
             admitted_count = len(admitted),
@@ -425,14 +467,28 @@ class LeaderService(trainer_pb2_grpc.TrainerServiceServicer):
             return
 
         async with self._lock:
-            alive = [w for w in self._workers.values() if w.is_alive]
+            # Prefer explicitly admitted workers (not in pending pool).
+            alive = [
+                w for w in self._workers.values()
+                if w.is_alive and w.worker_id not in self._pending_worker_ids
+            ]
+            if not alive:
+                # Nobody was explicitly admitted — fall back to admitting everyone.
+                # This preserves the simple workflow: workers connect, type 'start',
+                # training begins.  The gate only matters when you want a subset.
+                log.info(
+                    "No workers explicitly admitted — admitting all pending workers."
+                )
+                alive = [w for w in self._workers.values() if w.is_alive]
+                for w in alive:
+                    self._pending_worker_ids.discard(w.worker_id)
 
         if not alive:
             log.error("No alive workers — cannot start.")
             return
 
         # Score-proportional shard assignment
-        indices = list(range(TINY_IMAGENET_TRAIN))
+        indices = list(range(self._train_samples))
         log.info(f"Computing shards for {len(alive)} worker(s) …")
         self._compute_shards(alive, indices)
 
@@ -442,8 +498,8 @@ class LeaderService(trainer_pb2_grpc.TrainerServiceServicer):
 
         self._training_cfg = trainer_pb2.TrainingConfig(
             model_name       = getattr(self.cfg, "model_name", "resnet101"),
-            dataset          = "tiny_imagenet_200",
-            num_classes      = self.cfg.num_classes,
+            dataset          = getattr(self.cfg, "dataset", "tinyimagenet"),
+            num_classes      = self._num_classes,
             total_epochs     = self.cfg.epochs,
             base_lr          = self.cfg.lr,
             weight_decay     = self.cfg.weight_decay,
@@ -466,7 +522,7 @@ class LeaderService(trainer_pb2_grpc.TrainerServiceServicer):
             weight_decay              = self.cfg.weight_decay,
             batch_size                = getattr(self.cfg, "batch_size", 32),
             world_size                = world_size,
-            dataset_samples           = TINY_IMAGENET_TRAIN,
+            dataset_samples           = self._train_samples,
             raw_gradient_numel        = self._raw_gradient_numel,
             compressed_gradient_numel = self._compressed_gradient_numel,
             runs_root                 = getattr(self.cfg, "runs_root", "runs"),
@@ -611,24 +667,51 @@ class LeaderService(trainer_pb2_grpc.TrainerServiceServicer):
             return sum(1 for w in self._workers.values() if w.is_alive and w.assigned)
 
     async def _assign_late_worker(self, w: WorkerState) -> None:
-        """Assign a shard to a worker that joined after training started."""
-        import random
+        """
+        Phase 2 shard rebalancing: redistribute the full dataset proportionally
+        across all active workers + the newly admitted worker.
+
+        Existing workers are sent a RESHARD command (via the next heartbeat) and
+        temporarily removed from gradient rounds while they reload their data.
+        They re-join automatically when their first new ExchangeGradients call arrives.
+        """
         async with self._lock:
-            workers = list(self._workers.values())
+            active = [
+                wr for wr in self._workers.values()
+                if wr.is_alive and (wr.assigned or wr.worker_id == w.worker_id)
+            ]
 
-        total_score = sum(wr.score for wr in workers) or 1.0
-        frac        = w.score / total_score
-        n           = max(1, int(frac * TINY_IMAGENET_TRAIN))
-        base        = getattr(self.cfg, "batch_size", 32)
+        if w not in active:
+            active.append(w)
 
-        w.shard_indices    = random.sample(range(TINY_IMAGENET_TRAIN), n)
-        w.local_batch_size = max(8, min(256, int(base * frac * len(workers))))
+        # Score-proportional reshard across the full dataset
+        indices = list(range(self._train_samples))
+        self._compute_shards(active, indices)
 
-        # Unblock the worker's GetAssignment call immediately.
+        # Send RESHARD to each existing worker and exclude it from grad rounds
+        # until it signals it has rebuilt its loader (first ExchangeGradients call).
+        async with self._lock:
+            for wr in active:
+                if wr.worker_id == w.worker_id:
+                    continue
+                wr.pending_reshard = trainer_pb2.ShardAssignment(
+                    worker_id        = wr.worker_id,
+                    indices          = wr.shard_indices,
+                    local_batch_size = wr.local_batch_size,
+                    primary_device   = _infer_device(wr),
+                )
+                wr.assigned = False  # temporarily excluded from grad rounds
+                wr.cmd_queue.put_nowait(trainer_pb2.HeartbeatResponse.RESHARD)
+                log.info(
+                    f"  reshard cmd → {wr.hostname:<22}  "
+                    f"samples={len(wr.shard_indices):,}  batch={wr.local_batch_size}"
+                )
+
+        # Unblock the new worker's GetAssignment — it picks up its shard directly.
         w.assignment_queue.put_nowait(True)
         log.info(
-            f"  late shard → {w.hostname:<22}  "
-            f"frac={frac*100:.1f}%  samples={n:,}  batch={w.local_batch_size}"
+            f"  new shard   → {w.hostname:<22}  "
+            f"samples={len(w.shard_indices):,}  batch={w.local_batch_size}"
         )
 
     # ── Private: shard distribution ───────────────────────────────────────────
@@ -667,7 +750,7 @@ class LeaderService(trainer_pb2_grpc.TrainerServiceServicer):
         }
         model_fn = _MODELS.get(getattr(self.cfg, "model_name", "resnet101"), models.resnet101)
         self._model = model_fn(
-            weights=None, num_classes=self.cfg.num_classes
+            weights=None, num_classes=self._num_classes
         ).to(self._device)
         self._optimizer = torch.optim.SGD(
             self._model.parameters(),
@@ -791,7 +874,7 @@ class LeaderService(trainer_pb2_grpc.TrainerServiceServicer):
         batch_size      = getattr(self.cfg, "batch_size", 32)
         steps_per_epoch = max(
             1,
-            TINY_IMAGENET_TRAIN // (batch_size * max(1, len(grads)) * grad_accum),
+            self._train_samples // (batch_size * max(1, len(grads)) * grad_accum),
         )
         self._current_epoch = self._global_step // steps_per_epoch
 
@@ -808,10 +891,11 @@ class LeaderService(trainer_pb2_grpc.TrainerServiceServicer):
     # ── Private: validation evaluation (runs in thread pool) ─────────────────
 
     def _run_val_sync(self) -> float:
-        """Top-1 accuracy on the full Tiny ImageNet-200 val split."""
+        """Top-1 validation accuracy."""
         data_root = getattr(self.cfg, "data_root", None)
+        dataset   = getattr(self.cfg, "dataset", "tinyimagenet")
         try:
-            loader = make_val_loader(data_root, batch_size=128, cpu_cores=4)
+            loader = make_any_val_loader(dataset, data_root, batch_size=256, cpu_cores=4)
         except Exception as exc:
             log.warning(f"Val loader unavailable: {exc}")
             return 0.0
@@ -860,28 +944,43 @@ def _infer_device(w: WorkerState) -> str:
 async def cli_loop(service: LeaderService) -> None:
     loop = asyncio.get_event_loop()
     print()
-    print("  Commands:  start | status | reset | quit")
+    print("  Commands:  admit [id ...] | admit all | start | status | reset | quit")
     print()
     while True:
         try:
             line = await loop.run_in_executor(None, lambda: input("leader> "))
         except EOFError:
             break
-        cmd = line.strip().lower()
+        parts = line.strip().split()
+        if not parts:
+            continue
+        cmd = parts[0].lower()
+
         if cmd == "start":
             await service.start_training()
         elif cmd == "status":
             await service._print_status()
         elif cmd == "reset":
             await service.reset_training()
+        elif cmd == "admit":
+            ids = parts[1:]
+            if ids == ["all"]:
+                ids = []
+            resp = await service.AdmitWorkers(
+                trainer_pb2.AdmitWorkersRequest(worker_ids=ids), context=None
+            )
+            if resp.admitted_count:
+                print(f"  Admitted {resp.admitted_count}: {list(resp.admitted_ids)}")
+            else:
+                print("  No workers admitted.")
+            if resp.not_found_ids:
+                print(f"  Not found / already active: {list(resp.not_found_ids)}")
         elif cmd in ("quit", "exit", "q"):
             log.info("Shutting down.")
             sys.exit(0)
-        elif cmd == "":
-            pass
         else:
             print(f"  Unknown command: {cmd!r}")
-            print("  Try: start | status | reset | quit")
+            print("  Try: admit [id ...] | admit all | start | status | reset | quit")
 
 
 # ── Port conflict guard ───────────────────────────────────────────────────────
@@ -988,8 +1087,10 @@ if __name__ == "__main__":
                    help="Minimum workers before auto-start triggers")
     p.add_argument("--auto-start",   action="store_true",     dest="auto_start",
                    help="Start training automatically when min-workers threshold met")
+    p.add_argument("--dataset",      default="tinyimagenet",
+                   choices=["tinyimagenet", "cifar10"],
+                   help="Dataset to train on (default: tinyimagenet)")
     p.add_argument("--epochs",       type=int,   default=90)
-    p.add_argument("--num-classes",  type=int,   default=200, dest="num_classes")
     p.add_argument("--lr",           type=float, default=0.1)
     p.add_argument("--weight-decay", type=float, default=1e-4, dest="weight_decay")
     p.add_argument("--batch-size",   type=int,   default=32,   dest="batch_size",

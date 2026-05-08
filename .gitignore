@@ -29,3 +29,5 @@ checkpoints/
 .vscode/
 .idea/
 *.swp
+
+runs/

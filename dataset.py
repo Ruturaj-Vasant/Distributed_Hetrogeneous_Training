@@ -1,11 +1,10 @@
 """
-dataset.py  —  Tiny ImageNet-200 dataset management
+dataset.py  —  Dataset management for Tiny ImageNet-200 and CIFAR-10
 
-Handles download, val-set reorganisation (flat → ImageFolder layout),
-integrity verification, and DataLoader construction for both train and val splits.
+Handles download, setup, and DataLoader construction for both datasets.
 
-Can be run standalone to pre-download the dataset before training:
-    python3 dataset.py [--root ~/.cache/tiny-imagenet-200]
+Can be run standalone to pre-download:
+    python3 dataset.py [--dataset cifar10|tinyimagenet] [--root <path>]
 """
 from __future__ import annotations
 
@@ -19,7 +18,7 @@ import torch
 import torchvision.datasets as datasets
 import torchvision.transforms as T
 
-# ── Paths ─────────────────────────────────────────────────────────────────────
+# ── Tiny ImageNet-200 constants ───────────────────────────────────────────────
 
 DATASET_URL   = "http://cs231n.stanford.edu/tiny-imagenet-200.zip"
 DEFAULT_ROOT  = Path.home() / ".cache" / "tiny-imagenet-200"
@@ -27,6 +26,14 @@ NUM_CLASSES   = 200
 TRAIN_SAMPLES = 100_000
 VAL_SAMPLES   = 10_000
 IMG_SIZE      = 64
+
+# ── CIFAR-10 constants ────────────────────────────────────────────────────────
+
+CIFAR10_ROOT          = Path.home() / ".cache" / "cifar10"
+CIFAR10_NUM_CLASSES   = 10
+CIFAR10_TRAIN_SAMPLES = 50_000
+CIFAR10_VAL_SAMPLES   = 10_000
+CIFAR10_IMG_SIZE      = 32
 
 # ── Transforms ────────────────────────────────────────────────────────────────
 
@@ -209,17 +216,133 @@ def make_val_loader(
     )
 
 
+# ── CIFAR-10 support ──────────────────────────────────────────────────────────
+
+_CIFAR10_MEAN = [0.4914, 0.4822, 0.4465]
+_CIFAR10_STD  = [0.2470, 0.2435, 0.2616]
+
+CIFAR10_TRAIN_TRANSFORM = T.Compose([
+    T.RandomCrop(CIFAR10_IMG_SIZE, padding=4),
+    T.RandomHorizontalFlip(),
+    T.ToTensor(),
+    T.Normalize(_CIFAR10_MEAN, _CIFAR10_STD),
+])
+
+CIFAR10_VAL_TRANSFORM = T.Compose([
+    T.ToTensor(),
+    T.Normalize(_CIFAR10_MEAN, _CIFAR10_STD),
+])
+
+
+def ensure_cifar10(root: Path | None = None) -> Path:
+    """Download CIFAR-10 via torchvision if not already cached."""
+    root = Path(root or CIFAR10_ROOT)
+    root.mkdir(parents=True, exist_ok=True)
+    datasets.CIFAR10(root=str(root), train=True,  download=True)
+    datasets.CIFAR10(root=str(root), train=False, download=True)
+    print(f"[dataset] CIFAR-10 ready at {root}")
+    return root
+
+
+def make_cifar10_train_loader(
+    root:       Path | None,
+    indices:    list[int],
+    batch_size: int,
+    cpu_cores:  int,
+) -> torch.utils.data.DataLoader:
+    root   = Path(root or CIFAR10_ROOT)
+    full   = datasets.CIFAR10(root=str(root), train=True, transform=CIFAR10_TRAIN_TRANSFORM)
+    subset = torch.utils.data.Subset(full, indices)
+    nw     = min(4, max(1, cpu_cores // 2))
+    return torch.utils.data.DataLoader(
+        subset,
+        batch_size         = batch_size,
+        shuffle            = True,
+        num_workers        = nw,
+        pin_memory         = True,
+        drop_last          = True,
+        persistent_workers = nw > 0,
+    )
+
+
+def make_cifar10_val_loader(
+    root:       Path | None = None,
+    batch_size: int = 256,
+    cpu_cores:  int = 4,
+) -> torch.utils.data.DataLoader:
+    root = Path(root or CIFAR10_ROOT)
+    full = datasets.CIFAR10(root=str(root), train=False, transform=CIFAR10_VAL_TRANSFORM)
+    nw   = min(4, max(1, cpu_cores // 2))
+    return torch.utils.data.DataLoader(
+        full,
+        batch_size  = batch_size,
+        shuffle     = False,
+        num_workers = nw,
+        pin_memory  = True,
+    )
+
+
+# ── Unified interface (used by leader and worker) ──────────────────────────────
+
+def get_dataset_info(dataset: str) -> dict:
+    """Return constants for a given dataset name."""
+    if dataset == "cifar10":
+        return {
+            "num_classes":    CIFAR10_NUM_CLASSES,
+            "train_samples":  CIFAR10_TRAIN_SAMPLES,
+            "img_size":       CIFAR10_IMG_SIZE,
+        }
+    return {
+        "num_classes":    NUM_CLASSES,
+        "train_samples":  TRAIN_SAMPLES,
+        "img_size":       IMG_SIZE,
+    }
+
+
+def ensure_any_dataset(dataset: str, root: Path | None = None) -> None:
+    """Download the named dataset if not already cached."""
+    if dataset == "cifar10":
+        ensure_cifar10(root)
+    else:
+        ensure_dataset(root)
+
+
+def make_any_train_loader(
+    dataset:    str,
+    root:       Path | None,
+    indices:    list[int],
+    batch_size: int,
+    cpu_cores:  int,
+) -> torch.utils.data.DataLoader:
+    if dataset == "cifar10":
+        return make_cifar10_train_loader(root, indices, batch_size, cpu_cores)
+    return make_train_loader(root, indices, batch_size, cpu_cores)
+
+
+def make_any_val_loader(
+    dataset:    str,
+    root:       Path | None = None,
+    batch_size: int = 256,
+    cpu_cores:  int = 4,
+) -> torch.utils.data.DataLoader:
+    if dataset == "cifar10":
+        return make_cifar10_val_loader(root, batch_size, cpu_cores)
+    return make_val_loader(root, batch_size, cpu_cores)
+
+
 # ── Standalone download ───────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    p = argparse.ArgumentParser(description="Download and prepare Tiny ImageNet-200")
-    p.add_argument("--root", default=None, help=f"Cache directory (default: {DEFAULT_ROOT})")
+    p = argparse.ArgumentParser(description="Download and prepare a training dataset")
+    p.add_argument("--dataset", default="tinyimagenet", choices=["tinyimagenet", "cifar10"])
+    p.add_argument("--root", default=None, help="Cache directory override")
     args = p.parse_args()
 
     root = Path(args.root) if args.root else None
-    train_dir = ensure_dataset(root)
+    ensure_any_dataset(args.dataset, root)
 
-    ok = verify_dataset(root)
-    print(f"[dataset] Integrity check: {'PASS' if ok else 'FAIL'}")
-    if not ok:
-        print("[dataset] WARNING: dataset may be incomplete. Try deleting the cache and re-running.")
+    if args.dataset == "tinyimagenet":
+        ok = verify_dataset(root)
+        print(f"[dataset] Integrity check: {'PASS' if ok else 'FAIL'}")
+        if not ok:
+            print("[dataset] WARNING: dataset may be incomplete.")

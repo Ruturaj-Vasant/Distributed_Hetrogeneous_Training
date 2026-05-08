@@ -78,19 +78,32 @@ def _list_runs(runs_root: Path) -> None:
         print(f"No runs found under {runs_root}/")
         return
     print(f"\nRuns in {runs_root}/\n")
-    for r in runs:
+    hdr = f"  {'Name':<52} {'Workers':>7} {'Duration':>9} {'Samp/s':>8} {'Loss':>8} {'ValAcc':>8} {'Compress':>9}"
+    print(hdr)
+    print("  " + "─" * (len(hdr) - 2))
+    for r in sorted(runs):
         if not r.is_dir():
             continue
         summary_path = r / "summary.json"
-        if summary_path.exists():
-            with open(summary_path) as f:
-                s = json.load(f)
-            acc = s.get("final_val_acc")
-            acc_str = f"val_acc={acc:.4f}" if acc is not None else "val_acc=n/a"
-            loss = s.get("final_loss", 0.0)
-            print(f"  {r.name:<60}  loss={loss:.4f}  {acc_str}")
-        else:
+        if not summary_path.exists():
             print(f"  {r.name}  (no summary.json)")
+            continue
+        with open(summary_path) as f:
+            s = json.load(f)
+        acc      = s.get("final_val_acc")
+        acc_s    = f"{acc:.4f}" if acc is not None else "n/a"
+        loss     = s.get("final_loss", 0.0)
+        workers  = s.get("world_size", "?")
+        dur      = s.get("duration_seconds", 0.0)
+        dur_s    = f"{dur:.0f}s" if dur else "n/a"
+        sps      = s.get("samples_per_second", 0.0)
+        sps_s    = f"{sps:.1f}" if sps else "n/a"
+        cr       = s.get("compression_ratio", 1.0)
+        cr_s     = f"{cr:.4f}" if cr != 1.0 else "1.0 (full)"
+        print(
+            f"  {r.name:<52} {str(workers):>7} {dur_s:>9} {sps_s:>8}"
+            f" {loss:>8.4f} {acc_s:>8} {cr_s:>9}"
+        )
     print()
 
 
@@ -147,18 +160,51 @@ def _compare(runs: list[Path], labels: list[str], output: Path) -> None:
     fig.savefig(output, dpi=150)
     print(f"Saved {output}")
 
-    # Print summary table
+    # ── Summary table with speedup / efficiency ───────────────────────────────
+    # Use the solo run (world_size == 1) as baseline; fall back to first run.
+    baseline_dur = None
+    for d, _ in valid:
+        if d["summary"].get("world_size", 1) == 1:
+            baseline_dur = d["summary"].get("duration_seconds")
+            break
+    if baseline_dur is None:
+        baseline_dur = valid[0][0]["summary"].get("duration_seconds")
+
     print()
-    print(f"{'Label':<22} {'Model':<12} {'TopK':<10} {'Steps':>7} {'FinalLoss':>10} {'FinalAcc':>10}")
-    print("─" * 76)
+    print(
+        f"{'Label':<22} {'Model':<10} {'Workers':>7} {'TopK':>8} "
+        f"{'Steps':>7} {'Duration':>9} {'Samp/s':>8} "
+        f"{'Loss':>8} {'ValAcc':>8} {'Compress':>9} {'Speedup':>8} {'Efficiency':>10}"
+    )
+    print("─" * 120)
     for d, lbl in valid:
-        s      = d["summary"]
-        topk   = str(s.get("topk_k", "n/a"))
-        steps  = d["summary"].get("total_steps", len(d["steps"]))
-        loss   = s.get("final_loss", 0.0)
-        acc    = s.get("final_val_acc")
-        acc_s  = f"{acc:.4f}" if acc is not None else "n/a"
-        print(f"{lbl:<22} {s.get('model','?'):<12} {topk:<10} {steps:>7} {loss:>10.4f} {acc_s:>10}")
+        s        = d["summary"]
+        model    = s.get("model", "?")
+        workers  = s.get("world_size", 1)
+        topk     = str(s.get("topk_k", "n/a"))
+        steps    = s.get("total_steps", len(d["steps"]))
+        dur      = s.get("duration_seconds", 0.0)
+        dur_s    = f"{dur:.0f}s" if dur else "n/a"
+        sps      = s.get("samples_per_second", 0.0)
+        sps_s    = f"{sps:.1f}" if sps else "n/a"
+        loss     = s.get("final_loss", 0.0)
+        acc      = s.get("final_val_acc")
+        acc_s    = f"{acc:.4f}" if acc is not None else "n/a"
+        cr       = s.get("compression_ratio", 1.0)
+        cr_s     = f"{cr:.4f}"
+        # speedup = baseline_duration / this_duration
+        if baseline_dur and dur and dur > 0:
+            speedup    = baseline_dur / dur
+            efficiency = speedup / max(1, workers)
+            spd_s      = f"{speedup:.2f}x"
+            eff_s      = f"{efficiency:.2f}"
+        else:
+            spd_s = eff_s = "n/a"
+        print(
+            f"{lbl:<22} {model:<10} {str(workers):>7} {topk:>8} "
+            f"{steps:>7} {dur_s:>9} {sps_s:>8} "
+            f"{loss:>8.4f} {acc_s:>8} {cr_s:>9} {spd_s:>8} {eff_s:>10}"
+        )
     print()
 
 
