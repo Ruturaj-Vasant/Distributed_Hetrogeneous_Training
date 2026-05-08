@@ -326,11 +326,12 @@ class WorkerSharedState:
     for the primitive types used here (int, float, bool).
     """
     def __init__(self) -> None:
-        self.status:  int   = trainer_pb2.IDLE
-        self.loss:    float = -1.0
-        self.steps:   int   = 0
-        self.paused:  bool  = False
-        self.stop:    bool  = False   # leader sent STOP or connection error
+        self.status:              int   = trainer_pb2.IDLE
+        self.loss:                float = -1.0
+        self.steps:               int   = 0
+        self.paused:              bool  = False
+        self.stop:                bool  = False  # set on any halt condition
+        self.leader_disconnected: bool  = False  # True = connection loss, False = explicit STOP
 
 
 # ── Heartbeat coroutine (runs in asyncio) ─────────────────────────────────────
@@ -376,6 +377,7 @@ async def heartbeat_loop(
         pass
     except Exception as e:
         log.error(f"Heartbeat stream lost: {type(e).__name__}: {e}")
+        shared.leader_disconnected = True
         shared.stop = True
 
 
@@ -455,6 +457,7 @@ def training_loop(
                 log.error(
                     f"ExchangeGradients failed: {exc.code()}  {exc.details()}"
                 )
+                shared.leader_disconnected = True
                 shared.stop = True
                 return
 
@@ -549,107 +552,140 @@ async def run(cfg: argparse.Namespace) -> None:
             None, lambda: ensure_dataset(cfg.cache_dir)
         )
 
-    # ── Step 3/4: open gRPC channels and register ─────────────────────────────
-    async_ch, async_stub, sync_ch, sync_stub, reg = await _connect_and_register(
-        cfg, hw, bm
-    )
-    if not reg.accepted:
-        log.error(f"Registration rejected: {reg.reject_reason}")
-        await async_ch.close()
-        sync_ch.close()
-        return
-
-    worker_id = reg.worker_id
-    log.info(f"Registered as worker_id={worker_id}")
-
-    # ── Step 5: shared state + background heartbeat ───────────────────────────
-    shared    = WorkerSharedState()
-    hb_task   = asyncio.create_task(
-        heartbeat_loop(async_stub, worker_id, shared)
-    )
-
-    # ── Steps 6-9: training loop — repeats for each new job ──────────────────
     _MODEL_FNS = {
         "resnet18":  models.resnet18,
         "resnet50":  models.resnet50,
         "resnet101": models.resnet101,
     }
 
-    try:
-        while True:
-            # Step 6: wait for assignment
-            shared.status = trainer_pb2.IDLE
-            shared.stop   = False
-            shared.loss   = -1.0
-            shared.steps  = 0
-            log.info("Waiting for assignment from leader …  (leader must type 'start')")
+    # ── Reconnect loop: re-registers with a new leader after disconnection ────
+    while True:
 
-            assignment_resp = await async_stub.GetAssignment(
-                trainer_pb2.GetAssignmentRequest(worker_id=worker_id)
-            )
+        # Steps 3/4: open gRPC channels and register
+        async_ch, async_stub, sync_ch, sync_stub, reg = await _connect_and_register(
+            cfg, hw, bm
+        )
+        if not reg.accepted:
+            log.error(f"Registration rejected: {reg.reject_reason}")
+            await async_ch.close()
+            sync_ch.close()
+            return  # explicit rejection — don't retry
 
-            assignment = assignment_resp.assignment
-            config     = assignment_resp.config
-            device     = _resolve_device(assignment.primary_device)
+        worker_id = reg.worker_id
+        log.info(f"Registered as worker_id={worker_id}")
 
-            log.info(
-                f"Assignment received:  "
-                f"{len(assignment.indices):,} samples  "
-                f"batch={assignment.local_batch_size}  "
-                f"device={device}"
-            )
+        # Step 5: shared state + background heartbeat
+        shared  = WorkerSharedState()
+        hb_task = asyncio.create_task(
+            heartbeat_loop(async_stub, worker_id, shared)
+        )
 
-            # Step 7: build model + load initial weights
-            model_fn = _MODEL_FNS.get(config.model_name, models.resnet101)
-            log.info(f"Building {config.model_name} ({config.num_classes} classes) on {device} …")
-            model = model_fn(weights=None, num_classes=config.num_classes)
-            load_full_weights(model, assignment_resp.model_weights, device)
-            model = model.to(device).train()
-
-            # Step 8: build dataloader
-            if cfg.dry_run:
-                n_synthetic = min(len(assignment.indices), 320)
-                loader = _make_synthetic_loader(n_synthetic, assignment.local_batch_size, config.num_classes)
-                log.info(f"Synthetic DataLoader: {n_synthetic} samples  batch={assignment.local_batch_size}")
-            else:
-                loader = make_train_loader(
-                    root       = cfg.cache_dir,
-                    indices    = list(assignment.indices),
-                    batch_size = assignment.local_batch_size,
-                    cpu_cores  = hw.cpu_cores,
-                )
-            log.info(
-                f"DataLoader ready:  {len(loader.dataset):,} samples  "
-                f"batch={assignment.local_batch_size}  "
-                f"batches/epoch={len(loader)}"
-            )
-
-            # Step 9: training loop in thread pool
-            await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: training_loop(
-                    model, loader, sync_stub,
-                    worker_id, config, device, shared,
-                ),
-            )
-
-            if shared.stop:
-                # Error or STOP command from leader — exit worker
-                log.info("Stopping worker on leader instruction or training error.")
-                break
-
-            # Training completed normally — stay connected for next run
-            log.info("Training complete. Staying connected — waiting for next job (leader: 'reset' then 'start').")
-
-    finally:
-        hb_task.cancel()
         try:
-            await hb_task
-        except asyncio.CancelledError:
-            pass
-        await async_ch.close()
-        sync_ch.close()
-        log.info("Worker shut down.")
+            # Steps 6-9: job loop — repeats for each training run on this leader
+            while True:
+                shared.status             = trainer_pb2.IDLE
+                shared.stop               = False
+                shared.leader_disconnected = False
+                shared.loss               = -1.0
+                shared.steps              = 0
+                log.info("Waiting for assignment from leader …  (leader must type 'start')")
+
+                # Step 6: block until leader sends assignment
+                try:
+                    assignment_resp = await async_stub.GetAssignment(
+                        trainer_pb2.GetAssignmentRequest(worker_id=worker_id)
+                    )
+                except grpc.RpcError as exc:
+                    log.warning(
+                        f"GetAssignment lost ({exc.code().name}) — "
+                        "leader may have restarted."
+                    )
+                    shared.leader_disconnected = True
+                    break  # exit job loop → reconnect
+
+                assignment = assignment_resp.assignment
+                config     = assignment_resp.config
+                device     = _resolve_device(assignment.primary_device)
+
+                log.info(
+                    f"Assignment received:  "
+                    f"{len(assignment.indices):,} samples  "
+                    f"batch={assignment.local_batch_size}  "
+                    f"device={device}"
+                )
+
+                # Step 7: build model + load initial weights
+                model_fn = _MODEL_FNS.get(config.model_name, models.resnet101)
+                log.info(f"Building {config.model_name} ({config.num_classes} classes) on {device} …")
+                model = model_fn(weights=None, num_classes=config.num_classes)
+                load_full_weights(model, assignment_resp.model_weights, device)
+                model = model.to(device).train()
+
+                # Step 8: build dataloader
+                if cfg.dry_run:
+                    n_synthetic = min(len(assignment.indices), 320)
+                    loader = _make_synthetic_loader(
+                        n_synthetic, assignment.local_batch_size, config.num_classes
+                    )
+                    log.info(
+                        f"Synthetic DataLoader: {n_synthetic} samples  "
+                        f"batch={assignment.local_batch_size}"
+                    )
+                else:
+                    loader = make_train_loader(
+                        root       = cfg.cache_dir,
+                        indices    = list(assignment.indices),
+                        batch_size = assignment.local_batch_size,
+                        cpu_cores  = hw.cpu_cores,
+                    )
+                log.info(
+                    f"DataLoader ready:  {len(loader.dataset):,} samples  "
+                    f"batch={assignment.local_batch_size}  "
+                    f"batches/epoch={len(loader)}"
+                )
+
+                # Step 9: training loop in thread pool
+                await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: training_loop(
+                        model, loader, sync_stub,
+                        worker_id, config, device, shared,
+                    ),
+                )
+
+                if shared.stop:
+                    if shared.leader_disconnected:
+                        log.warning("Leader disconnected during training.")
+                        break  # exit job loop → reconnect
+                    else:
+                        log.info("Stopping on leader instruction.")
+                        return  # explicit STOP — exit completely
+
+                log.info(
+                    "Training complete. Staying connected — "
+                    "waiting for next job (leader: 'reset' then 'start')."
+                )
+
+        finally:
+            hb_task.cancel()
+            try:
+                await hb_task
+            except asyncio.CancelledError:
+                pass
+            await async_ch.close()
+            sync_ch.close()
+
+        if not shared.leader_disconnected:
+            # Job loop exited cleanly (explicit STOP already returned above,
+            # so this path shouldn't be reachable — safety exit).
+            log.info("Worker shut down.")
+            return
+
+        log.info(
+            "Leader disconnected. Waiting 10 s before reconnecting … "
+            "(start a new leader and this worker will re-register automatically)"
+        )
+        await asyncio.sleep(10)
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
