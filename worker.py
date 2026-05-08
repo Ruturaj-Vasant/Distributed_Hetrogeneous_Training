@@ -684,6 +684,14 @@ async def run(cfg: argparse.Namespace) -> None:
                         f"batch={assignment.local_batch_size}"
                     )
                 else:
+                    if dataset_name != cfg.dataset:
+                        log.info(
+                            f"Leader requested {dataset_name!r} but worker pre-downloaded "
+                            f"{cfg.dataset!r} — downloading {dataset_name} now …"
+                        )
+                        await asyncio.get_event_loop().run_in_executor(
+                            None, lambda: ensure_any_dataset(dataset_name, cfg.cache_dir)
+                        )
                     loader = make_any_train_loader(
                         dataset    = dataset_name,
                         root       = cfg.cache_dir,
