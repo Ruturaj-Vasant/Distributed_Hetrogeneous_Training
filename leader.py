@@ -808,15 +808,18 @@ class LeaderService(trainer_pb2_grpc.TrainerServiceServicer):
                 param = named_params.get(sg.layer_name)
                 if param is None:
                     continue
-                shape     = list(sg.shape)
-                n_elems   = 1
+                shape   = list(sg.shape)
+                n_elems = 1
                 for d in shape:
                     n_elems *= d
-                flat = torch.zeros(n_elems, device=self._device)
-                flat[list(sg.indices)] = torch.tensor(
-                    list(sg.values), device=self._device
-                )
-                grad = flat.reshape(shape)
+                # Build sparse grad on CPU (fast list→tensor), then one device transfer.
+                # Creating tensors from Python lists directly on MPS/CUDA is slow
+                # because PyTorch materialises a CPU tensor first anyway.
+                indices_t = torch.tensor(sg.indices, dtype=torch.long)
+                values_t  = torch.tensor(sg.values,  dtype=torch.float32)
+                flat_cpu  = torch.zeros(n_elems)
+                flat_cpu.scatter_(0, indices_t, values_t)
+                grad = flat_cpu.reshape(shape).to(self._device)
                 if param.grad is None:
                     param.grad = grad * weight
                 else:
