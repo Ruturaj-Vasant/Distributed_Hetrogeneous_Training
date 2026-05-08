@@ -1,0 +1,662 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Distributed ResNet — Command Reference</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:       #0f1117;
+      --surface:  #1a1d27;
+      --border:   #2a2d3e;
+      --accent:   #4f8ef7;
+      --green:    #34d399;
+      --yellow:   #fbbf24;
+      --red:      #f87171;
+      --text:     #e2e8f0;
+      --muted:    #64748b;
+      --code-bg:  #0d1117;
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      line-height: 1.6;
+      padding: 2rem 1rem 4rem;
+    }
+
+    .page {
+      max-width: 860px;
+      margin: 0 auto;
+    }
+
+    /* ── Header ── */
+    header {
+      text-align: center;
+      margin-bottom: 3rem;
+      padding-bottom: 2rem;
+      border-bottom: 1px solid var(--border);
+    }
+    header h1 {
+      font-size: 1.9rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+    }
+    header h1 span { color: var(--accent); }
+    header p {
+      margin-top: 0.5rem;
+      color: var(--muted);
+      font-size: 0.95rem;
+    }
+    .badges {
+      display: flex;
+      gap: 0.5rem;
+      justify-content: center;
+      margin-top: 1rem;
+      flex-wrap: wrap;
+    }
+    .badge {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 99px;
+      padding: 0.2rem 0.75rem;
+      font-size: 0.78rem;
+      color: var(--muted);
+    }
+    .badge.blue  { border-color: #2d4a8a; color: var(--accent); }
+    .badge.green { border-color: #1a4a3a; color: var(--green);  }
+
+    /* ── Sequence bar ── */
+    .sequence {
+      display: flex;
+      align-items: center;
+      gap: 0;
+      margin-bottom: 2.5rem;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      overflow: hidden;
+      flex-wrap: wrap;
+    }
+    .seq-step {
+      flex: 1;
+      min-width: 120px;
+      padding: 0.9rem 1rem;
+      text-align: center;
+      font-size: 0.8rem;
+      position: relative;
+    }
+    .seq-step + .seq-step::before {
+      content: "→";
+      position: absolute;
+      left: -0.6rem;
+      top: 50%;
+      transform: translateY(-50%);
+      color: var(--muted);
+      font-size: 0.9rem;
+    }
+    .seq-step .num {
+      display: block;
+      font-size: 1.1rem;
+      font-weight: 700;
+      color: var(--accent);
+      margin-bottom: 0.1rem;
+    }
+    .seq-step .label { color: var(--muted); }
+
+    /* ── Section ── */
+    section {
+      margin-bottom: 2.5rem;
+    }
+    .section-header {
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+      margin-bottom: 1rem;
+    }
+    .section-header h2 {
+      font-size: 1rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted);
+    }
+    .section-header .dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+    .dot-blue   { background: var(--accent); }
+    .dot-green  { background: var(--green);  }
+    .dot-yellow { background: var(--yellow); }
+    .dot-red    { background: var(--red);    }
+
+    /* ── Card ── */
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      overflow: hidden;
+      margin-bottom: 1rem;
+    }
+    .card-title {
+      padding: 0.65rem 1rem;
+      border-bottom: 1px solid var(--border);
+      font-size: 0.8rem;
+      color: var(--muted);
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+    .card-title strong { color: var(--text); font-size: 0.85rem; }
+    .card-title .platform {
+      margin-left: auto;
+      font-size: 0.72rem;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 0.1rem 0.4rem;
+      color: var(--muted);
+    }
+
+    /* ── Code block ── */
+    .code-wrap {
+      position: relative;
+    }
+    pre {
+      background: var(--code-bg);
+      padding: 1rem 1rem 1rem 1.1rem;
+      font-family: "SF Mono", "Fira Code", "Cascadia Code", Menlo, monospace;
+      font-size: 0.82rem;
+      line-height: 1.7;
+      overflow-x: auto;
+      white-space: pre;
+      color: #c9d1d9;
+    }
+    pre .comment { color: #484f58; }
+    pre .prompt  { color: var(--muted); user-select: none; }
+    pre .cmd     { color: #79c0ff; }
+    pre .arg     { color: #d2a8ff; }
+    pre .val     { color: var(--green); }
+    pre .flag    { color: #ffa657; }
+
+    .copy-btn {
+      position: absolute;
+      top: 0.6rem;
+      right: 0.6rem;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--muted);
+      font-size: 0.72rem;
+      padding: 0.25rem 0.6rem;
+      cursor: pointer;
+      transition: all 0.15s;
+      font-family: inherit;
+    }
+    .copy-btn:hover  { border-color: var(--accent); color: var(--accent); }
+    .copy-btn.copied { border-color: var(--green);  color: var(--green);  }
+
+    /* ── Note / callout ── */
+    .note {
+      background: #131a2e;
+      border: 1px solid #1e3a5f;
+      border-left: 3px solid var(--accent);
+      border-radius: 0 6px 6px 0;
+      padding: 0.6rem 1rem;
+      font-size: 0.82rem;
+      color: #93b4dc;
+      margin-top: 0.75rem;
+    }
+    .note.warn {
+      background: #1a1400;
+      border-color: #4a3800;
+      border-left-color: var(--yellow);
+      color: #c9a84c;
+    }
+
+    /* ── Flags table ── */
+    .flags-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.82rem;
+    }
+    .flags-table th {
+      text-align: left;
+      padding: 0.5rem 0.75rem;
+      color: var(--muted);
+      font-weight: 600;
+      font-size: 0.72rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      border-bottom: 1px solid var(--border);
+    }
+    .flags-table td {
+      padding: 0.55rem 0.75rem;
+      border-bottom: 1px solid #1e2132;
+      vertical-align: top;
+    }
+    .flags-table tr:last-child td { border-bottom: none; }
+    .flags-table tr:hover td { background: #1e2235; }
+    code {
+      font-family: "SF Mono", "Fira Code", Menlo, monospace;
+      font-size: 0.8em;
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 0.1em 0.35em;
+      color: #ffa657;
+    }
+    .default-val {
+      font-family: "SF Mono", "Fira Code", Menlo, monospace;
+      font-size: 0.8em;
+      color: var(--green);
+    }
+
+    /* ── Footer ── */
+    footer {
+      text-align: center;
+      margin-top: 3rem;
+      padding-top: 1.5rem;
+      border-top: 1px solid var(--border);
+      font-size: 0.78rem;
+      color: var(--muted);
+    }
+    footer a { color: var(--accent); text-decoration: none; }
+    footer a:hover { text-decoration: underline; }
+
+    @media (max-width: 600px) {
+      header h1 { font-size: 1.4rem; }
+      .seq-step .num { font-size: 0.9rem; }
+      pre { font-size: 0.75rem; }
+    }
+  </style>
+</head>
+<body>
+<div class="page">
+
+  <!-- ── Header ── -->
+  <header>
+    <h1>Distributed <span>ResNet</span> Training</h1>
+    <p>Parameter-server training across heterogeneous laptops via Tailscale</p>
+    <div class="badges">
+      <span class="badge blue">ResNet-18 / 50 / 101</span>
+      <span class="badge blue">Tiny ImageNet-200</span>
+      <span class="badge green">MPS + CUDA</span>
+      <span class="badge">Tailscale VPN</span>
+      <span class="badge">gRPC</span>
+    </div>
+  </header>
+
+  <!-- ── Sequence ── -->
+  <div class="sequence">
+    <div class="seq-step"><span class="num">1</span><span class="label">Start leader</span></div>
+    <div class="seq-step"><span class="num">2</span><span class="label">Join workers</span></div>
+    <div class="seq-step"><span class="num">3</span><span class="label">Type <code>start</code></span></div>
+    <div class="seq-step"><span class="num">4</span><span class="label">Training runs</span></div>
+    <div class="seq-step"><span class="num">5</span><span class="label">Results saved</span></div>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- LEADER                                                            -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <section>
+    <div class="section-header">
+      <div class="dot dot-blue"></div>
+      <h2>Step 1 — Start the Leader</h2>
+    </div>
+
+    <div class="card">
+      <div class="card-title">
+        <strong>Leader machine (parameter server)</strong>
+        <span class="platform">macOS</span>
+      </div>
+      <div class="code-wrap">
+        <pre><span class="comment"># Navigate to the project and pull latest</span>
+<span class="cmd">cd</span> <span class="val">/Users/ruturaj_vasant/Desktop/Academic/AI_New/distributed-resnet</span>
+<span class="cmd">git pull</span>
+<span class="cmd">python3</span> leader.py <span class="flag">--model</span> <span class="val">resnet18</span> <span class="flag">--epochs</span> <span class="val">1</span> <span class="flag">--lr</span> <span class="val">0.01</span> <span class="flag">--batch-size</span> <span class="val">32</span></pre>
+        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+      </div>
+    </div>
+
+    <div class="note">
+      Wait for <code>Commands: start | status | reset | quit</code> — do <strong>not</strong> type <code>start</code> yet. Add workers first.
+    </div>
+  </section>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- WORKERS                                                           -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <section>
+    <div class="section-header">
+      <div class="dot dot-green"></div>
+      <h2>Step 2 — Join as a Worker</h2>
+    </div>
+
+    <!-- Worker: leader machine second terminal -->
+    <div class="card">
+      <div class="card-title">
+        <strong>Leader machine — second terminal</strong>
+        <span class="platform">macOS</span>
+      </div>
+      <div class="code-wrap">
+        <pre><span class="cmd">cd</span> <span class="val">/Users/ruturaj_vasant/Desktop/Academic/AI_New/distributed-resnet</span>
+<span class="cmd">python3</span> worker.py</pre>
+        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+      </div>
+    </div>
+
+    <!-- Worker: remote Mac -->
+    <div class="card">
+      <div class="card-title">
+        <strong>Any other Mac — fresh clone</strong>
+        <span class="platform">macOS</span>
+      </div>
+      <div class="code-wrap">
+        <pre><span class="comment"># Clone repo, bootstrap runs automatically (venv + deps + dataset)</span>
+<span class="cmd">git clone</span> <span class="val">https://github.com/Ruturaj-Vasant/Distributed_Hetrogeneous_Training.git</span> ~/distributed-resnet
+<span class="cmd">cd</span> ~/distributed-resnet
+<span class="cmd">python3</span> worker.py</pre>
+        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+      </div>
+    </div>
+
+    <!-- Worker: Windows -->
+    <div class="card">
+      <div class="card-title">
+        <strong>Any Windows machine — fresh clone</strong>
+        <span class="platform">Windows (PowerShell)</span>
+      </div>
+      <div class="code-wrap">
+        <pre><span class="cmd">git clone</span> <span class="val">https://github.com/Ruturaj-Vasant/Distributed_Hetrogeneous_Training.git</span> <span class="val">$HOME\distributed-resnet</span>
+<span class="cmd">cd</span> <span class="val">$HOME\distributed-resnet</span>
+<span class="cmd">python</span> worker.py</pre>
+        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+      </div>
+    </div>
+
+    <div class="note warn">
+      First run downloads PyTorch + deps (~1 GB) and Tiny ImageNet-200 (~236 MB). Subsequent runs skip this entirely. Add <code>--dry-run</code> to test the protocol with synthetic data only.
+    </div>
+    <div class="note">
+      Add as many workers as you like. Each one self-registers, gets a data shard proportional to its hardware score, and starts training when you type <code>start</code>. Workers automatically reconnect if the leader restarts.
+    </div>
+  </section>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- START                                                             -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <section>
+    <div class="section-header">
+      <div class="dot dot-yellow"></div>
+      <h2>Step 3 — Begin Training</h2>
+    </div>
+
+    <div class="card">
+      <div class="card-title">
+        <strong>In the leader terminal — once all workers are registered</strong>
+      </div>
+      <div class="code-wrap">
+        <pre><span class="val">start</span></pre>
+        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+      </div>
+    </div>
+
+    <div class="note">
+      Other interactive commands: <code>status</code> — print progress line &nbsp;|&nbsp; <code>reset</code> — clear state for next run &nbsp;|&nbsp; <code>quit</code> — stop leader (workers reconnect automatically)
+    </div>
+  </section>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- WATCH CLUSTER                                                     -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <section>
+    <div class="section-header">
+      <div class="dot dot-red"></div>
+      <h2>Optional — Live Cluster Monitor</h2>
+    </div>
+
+    <div class="card">
+      <div class="card-title">
+        <strong>Any terminal on any machine in the Tailscale network</strong>
+        <span class="platform">macOS</span>
+      </div>
+      <div class="code-wrap">
+        <pre><span class="comment"># From the project directory</span>
+<span class="cmd">python3</span> watch_cluster.py
+
+<span class="comment"># Or from a fresh clone (only needs grpcio)</span>
+<span class="cmd">git clone</span> <span class="val">https://github.com/Ruturaj-Vasant/Distributed_Hetrogeneous_Training.git</span> ~/distributed-resnet
+<span class="cmd">pip install</span> grpcio
+<span class="cmd">python3</span> ~/distributed-resnet/watch_cluster.py</pre>
+        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- COMPARE RUNS                                                      -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <section>
+    <div class="section-header">
+      <div class="dot dot-blue"></div>
+      <h2>Compare Experiment Results</h2>
+    </div>
+
+    <div class="card">
+      <div class="card-title"><strong>List all saved runs</strong></div>
+      <div class="code-wrap">
+        <pre><span class="cmd">python3</span> run_experiments.py <span class="flag">--list</span></pre>
+        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title"><strong>Generate comparison plot across experiments</strong></div>
+      <div class="code-wrap">
+        <pre><span class="cmd">python3</span> run_experiments.py \
+  <span class="flag">--runs</span>   <span class="val">runs/exp1_dir runs/exp2_dir runs/exp3_dir</span> \
+  <span class="flag">--labels</span> <span class="val">"EXP1 Solo" "EXP2 PS Full" "EXP3 PS TopK"</span> \
+  <span class="flag">--output</span> <span class="val">comparison.png</span></pre>
+        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- FLAGS                                                             -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <section>
+    <div class="section-header">
+      <div class="dot dot-blue"></div>
+      <h2>Leader Flags Reference</h2>
+    </div>
+
+    <div class="card">
+      <div style="overflow-x:auto;">
+        <table class="flags-table">
+          <thead>
+            <tr>
+              <th>Flag</th>
+              <th>Default</th>
+              <th>Description</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>--model</code></td>
+              <td><span class="default-val">resnet101</span></td>
+              <td><code>resnet18</code>, <code>resnet50</code>, or <code>resnet101</code></td>
+            </tr>
+            <tr>
+              <td><code>--epochs</code></td>
+              <td><span class="default-val">90</span></td>
+              <td>Number of training epochs</td>
+            </tr>
+            <tr>
+              <td><code>--lr</code></td>
+              <td><span class="default-val">0.1</span></td>
+              <td>SGD learning rate</td>
+            </tr>
+            <tr>
+              <td><code>--batch-size</code></td>
+              <td><span class="default-val">32</span></td>
+              <td>Base batch size — each worker scales proportionally to its hardware score</td>
+            </tr>
+            <tr>
+              <td><code>--weight-decay</code></td>
+              <td><span class="default-val">1e-4</span></td>
+              <td>SGD weight decay (L2 regularisation)</td>
+            </tr>
+            <tr>
+              <td><code>--topk</code></td>
+              <td><span class="default-val">50000</span></td>
+              <td>Top-K gradient elements kept per layer. <code>0</code> = full gradients (no compression)</td>
+            </tr>
+            <tr>
+              <td><code>--port</code></td>
+              <td><span class="default-val">50051</span></td>
+              <td>gRPC server port</td>
+            </tr>
+            <tr>
+              <td><code>--min-workers</code></td>
+              <td><span class="default-val">1</span></td>
+              <td>Minimum workers before auto-start</td>
+            </tr>
+            <tr>
+              <td><code>--auto-start</code></td>
+              <td><span class="default-val">off</span></td>
+              <td>Start automatically when min-workers threshold is met</td>
+            </tr>
+            <tr>
+              <td><code>--data-root</code></td>
+              <td><span class="default-val">~/.cache/tiny-imagenet-200</span></td>
+              <td>Override dataset cache path</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:1rem;">
+      <div class="card-title"><strong>Worker Flags Reference</strong></div>
+      <div style="overflow-x:auto;">
+        <table class="flags-table">
+          <thead>
+            <tr>
+              <th>Flag</th>
+              <th>Default</th>
+              <th>Description</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>--leader</code></td>
+              <td><span class="default-val">leader-macbook-pro.taila5426e.ts.net</span></td>
+              <td>Leader hostname or Tailscale magic DNS</td>
+            </tr>
+            <tr>
+              <td><code>--port</code></td>
+              <td><span class="default-val">50051</span></td>
+              <td>Leader gRPC port</td>
+            </tr>
+            <tr>
+              <td><code>--dry-run</code></td>
+              <td><span class="default-val">off</span></td>
+              <td>Use synthetic data — tests the protocol without downloading the dataset</td>
+            </tr>
+            <tr>
+              <td><code>--cache-dir</code></td>
+              <td><span class="default-val">~/.cache/tiny-imagenet-200</span></td>
+              <td>Override dataset cache path</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!-- ARCHITECTURE                                                       -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <section>
+    <div class="section-header">
+      <div class="dot dot-blue"></div>
+      <h2>Architecture</h2>
+    </div>
+    <div class="card">
+      <div class="code-wrap">
+        <pre>
+  ┌─────────────────────────────────────┐
+  │            Leader  (Mac)            │
+  │  ┌───────────────────────────────┐  │
+  │  │  Parameter Server (gRPC)      │  │
+  │  │  • Aggregate gradients        │  │
+  │  │  • SGD optimizer step         │  │
+  │  │  • Send weight delta back     │  │
+  │  │  • Val accuracy after epoch   │  │
+  │  └───────────────────────────────┘  │
+  └──────┬──────────┬───────────────────┘
+         │          │   Tailscale VPN
+  ┌──────┴──┐  ┌────┴──────┐
+  │Worker 1 │  │ Worker 2  │  ← any number
+  │Mac/MPS  │  │ Win/CUDA  │
+  │ TopK ↑  │  │ TopK ↑    │
+  └─────────┘  └───────────┘
+  Each worker: forward → loss.backward() → Top-K compress → ExchangeGradients RPC</pre>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    <p>
+      <a href="https://github.com/Ruturaj-Vasant/Distributed_Hetrogeneous_Training" target="_blank">GitHub Repository</a>
+      &nbsp;·&nbsp;
+      Tiny ImageNet-200 &nbsp;·&nbsp; PyTorch &nbsp;·&nbsp; gRPC &nbsp;·&nbsp; Tailscale
+    </p>
+  </footer>
+
+</div>
+
+<script>
+  function copyCode(btn) {
+    const pre = btn.closest('.code-wrap').querySelector('pre');
+    // Strip HTML tags to get plain text
+    const text = pre.innerText
+      .split('\n')
+      .map(l => l.trimEnd())
+      .join('\n')
+      .trim();
+
+    navigator.clipboard.writeText(text).then(() => {
+      btn.textContent = '✓ Copied';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = 'Copy';
+        btn.classList.remove('copied');
+      }, 1800);
+    }).catch(() => {
+      // Fallback for non-HTTPS
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      document.body.removeChild(ta);
+      btn.textContent = '✓ Copied';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = 'Copy';
+        btn.classList.remove('copied');
+      }, 1800);
+    });
+  }
+</script>
+</body>
+</html>
