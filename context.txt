@@ -1,0 +1,396 @@
+# PROJECT OVERVIEW
+
+Building a distributed heterogeneous training system for ResNet-101 on Tiny ImageNet-200.
+Multiple laptops (Mac MPS + Windows CUDA) connected via Tailscale VPN.
+Architecture: Parameter Server (NOT PyTorch DDP). Leader holds model, workers compute
+gradients, push compressed gradients to leader, leader aggregates + steps optimizer,
+returns weight delta to workers.
+
+Why not DDP: MPS and CUDA cannot share NCCL/Gloo backends. DDP requires homogeneous
+hardware and serializes on slowest worker. Parameter server handles heterogeneous devices
+and unequal batch sizes naturally.
+
+GitHub repo: https://github.com/Ruturaj-Vasant/Distributed_Hetrogeneous_Training
+Remote: git@github.com:Ruturaj-Vasant/Distributed_Hetrogeneous_Training.git
+Local (leader machine): /Users/ruturaj_vasant/Desktop/Academic/AI_New/distributed-resnet
+Local (worker clone): ~/distributed-resnet (created by bootstrap script)
+
+
+# CURRENT STATUS
+
+Two-machine test in progress. Leader runs on Ruturaj's MacBook Pro (M3 Pro, MPS).
+Worker is Devanshi's MacBook Air (M3, 10 GPU cores). Both on NYU wifi via Tailscale.
+
+Tailscale ping between machines works. DNS/IP gRPC was proven to work in a clean
+one-worker dry-run on port 50052 using leader-macbook-pro.taila5426e.ts.net.
+
+The later 50051 failure:
+  "connection attempt timed out before receiving SETTINGS frame"
+was diagnosed on 2026-05-08 as duplicate leader processes sharing the same gRPC
+port. lsof showed two Python leaders bound to 50051; one was STAT T (stopped).
+TCP nc succeeded because the port was open, but gRPC could land on the stopped
+process and hang before receiving HTTP/2 SETTINGS.
+
+Fixes committed and pushed (commit f264ba4, 2026-05-08):
+- leader.py: _kill_existing_leader() uses lsof to SIGTERM any process already
+  on the port before binding. Disables grpc.so_reuseport. On startup you now
+  see "Stopped existing leader process(es) on port 50051: [PID]" if anything
+  was killed, or nothing if port was clear.
+- worker.py: _connect_and_register() retry loop with configurable backoff.
+  asyncio imported at module level. New flags: --connect-timeout, --rpc-timeout,
+  --connect-retries, --retry-backoff, --max-retry-backoff.
+
+System is architecturally correct and all known bugs are fixed. Ready for
+two-machine real test.
+
+
+# COMPLETED WORK
+
+1. proto/trainer.proto — gRPC service with 5 RPCs:
+   Register, Heartbeat (bidi stream), GetAssignment, ExchangeGradients, GetClusterStatus
+
+2. hardware_probe.py — cross-platform HW detection + microbenchmark score
+   Score formula: cpu_cores×0.5 + ram×0.1 + cuda_vram×8 + mps_cores×0.3 + 50×(100/forward_ms)
+   Tested: M3 Pro → score≈1530, bench≈3.3ms
+
+3. dataset.py — Tiny ImageNet-200 download/extract/reorganize
+   ensure_dataset(): downloads zip, extracts, reorganizes val/ to ImageFolder format
+   make_train_loader(): Subset with worker shard indices
+   Normalization: mean=[0.4802,0.4481,0.3975] std=[0.2770,0.2691,0.2821]
+   Cache: ~/.cache/tiny-imagenet-200 (~236 MB)
+
+4. leader.py — parameter server + CLI
+   - aio.server() with 256 MB message limits (fixed RESOURCE_EXHAUSTED bug)
+   - Disabled grpc.so_reuseport so duplicate leaders cannot silently bind same port
+   - Non-interactive mode: sys.stdin.isatty() check → uses server.wait_for_termination()
+     instead of cli_loop() when stdin is not a TTY (subprocess/CI mode)
+   - --model flag: resnet18/50/101, defaults to resnet101
+   - Score-proportional sharding: worker_fraction = worker_score / sum(all_scores)
+   - Dead worker recovery in heartbeat_monitor()
+   - asyncio.Condition for gradient sync (last worker to arrive aggregates)
+   - Weight delta approach (not full state dict) after first sync
+
+5. worker.py — worker implementation
+   - Two gRPC channels: async (aio) for heartbeat+GetAssignment, sync for ExchangeGradients
+   - Top-K gradient sparsification (configurable topk_k, default 50000)
+   - --dry-run flag: uses _SyntheticDataset (320 samples) instead of real dataset
+   - Connection readiness + registration retry loop for transient Tailscale/gRPC failures
+   - New CLI knobs: --connect-timeout, --rpc-timeout, --connect-retries,
+     --retry-backoff, --max-retry-backoff
+   - Clean RuntimeError handling on connection exhaustion (no raw AioRpcError traceback)
+   - Fixed: aio.sleep(5) → asyncio.sleep(5) in heartbeat_loop (grpc.aio has no sleep())
+   - Broad exception handler in heartbeat_loop (was only catching AioRpcError, now catches all)
+   - Fixed: hardcoded resnet101 → dict lookup using config.model_name
+
+6. generate_proto.sh — fixed python→python3, sed→Python-based import fix for macOS
+
+7. test_e2e.py — 5 tests, 12 assertions, all passing (single worker, bidi heartbeat,
+   two-worker proportional shards, late registration rejection, GetClusterStatus)
+
+8. scripts/worker_macos.sh — one-shot Mac bootstrap (Xcode CLT, Homebrew, Python 3.11,
+   Tailscale, git clone/pull, venv, MPS PyTorch, requirements, proto stubs, dataset, worker)
+
+9. scripts/worker_windows.ps1 — one-shot Windows bootstrap with nvidia-smi CUDA detection,
+   auto-selects cu124/cu121/cu118/cpu PyTorch build
+
+10. README.md — architecture diagram, quick-start, env vars table, sharding explanation
+
+11. Two-process smoke test: 10/10 checks passed (leader + worker as subprocesses,
+    dry-run, resnet18, 1 epoch, port 50061)
+
+All fixes committed and pushed to main:
+- 089213e: gRPC 4 MB limit + non-interactive leader mode
+- 83dd643: heartbeat aio.sleep fix + broad exception handler
+- f264ba4: auto-kill stale leader on startup + worker connection retry loop
+
+
+# IN-PROGRESS WORK
+
+Real two-machine test:
+- Leader: Ruturaj's MacBook Pro (M3 Pro), Tailscale hostname leader-macbook-pro.taila5426e.ts.net
+- Worker: Devanshi's MacBook Air (M3 10-core), Tailscale hostname devanshis-macbook-air.taila5426e.ts.net
+
+Most recent failure: gRPC SETTINGS frame timeout when connecting to 100.79.142.77:50051.
+Diagnosis: duplicate leader processes were both listening on 50051; the older process
+was stopped (STAT T), causing some gRPC handshakes to hang. This is now mitigated in
+code by disabling grpc.so_reuseport, but any currently-running stale leaders still need
+to be killed before starting a clean run.
+
+Devanshi's Mac has already run the bootstrap script and has:
+- Repo cloned at ~/distributed-resnet
+- Dataset cached at ~/.cache/tiny-imagenet-200 (no re-download needed)
+- Venv with all dependencies installed
+
+
+# NEXT STEPS
+
+Immediate:
+1. Kill all stale leader processes: lsof -nP -iTCP:50051 -sTCP:LISTEN, then kill the listed PIDs.
+2. Restart one patched leader fresh: cd ~/Desktop/Academic/AI_New/distributed-resnet && python3 leader.py --min-workers 1 --model resnet101 --epochs 5
+3. On Devanshi's Mac: cd ~/distributed-resnet && git pull, or manually apply the local worker retry patch if it has not been pushed yet.
+4. Run worker: python3 worker.py --leader leader-macbook-pro.taila5426e.ts.net --port 50051 --dry-run
+   Alternative via bootstrap: LEADER_HOST=leader-macbook-pro.taila5426e.ts.net bash scripts/worker_macos.sh
+5. Type 'start' on leader once worker shows 'alive' in status table
+6. Monitor training: watch for "Step N loss=..." on leader and "Epoch X/Y done" on worker
+
+If gRPC still fails after fresh restart:
+- Try: python3 worker.py --leader 127.0.0.1 --port 50051 --dry-run (same machine test)
+- Check lsof for duplicate leaders; there should be exactly one listener on 50051
+- Check leader logs for any output when connection attempted
+- Run: curl -v http://100.79.142.77:50051 to probe what the server returns
+- Consider: Tailscale MTU causing HTTP/2 fragmentation issues (set grpc keepalive options)
+
+After successful two-machine run:
+- Test with Windows CUDA worker (use worker_windows.ps1)
+- Test with 2+ workers simultaneously
+- Run full resnet101 training (90 epochs) and track val accuracy
+- Consider adding tensorboard logging to leader
+
+
+# TECHNICAL ARCHITECTURE
+
+## Communication
+- Transport: gRPC over Tailscale WireGuard VPN
+- Leader port: 50051 (default)
+- Protocol: protobuf (proto/trainer.proto)
+- Message size limit: 256 MB on both server (leader.py) and client channels (worker.py)
+- Leader disables grpc.so_reuseport to prevent multiple leader processes from sharing 50051
+- Heartbeat interval: 5 seconds (asyncio.sleep(5) in worker heartbeat_loop)
+- Heartbeat timeout: ~15 seconds before worker marked DEAD on leader
+
+## gRPC Channel Design (worker)
+- async_ch = aio.insecure_channel(...) → for Heartbeat (bidi stream) + GetAssignment (blocking unary)
+- sync_ch = grpc.insecure_channel(...) → for ExchangeGradients (called from training thread)
+- Reason: training loop runs in asyncio.get_event_loop().run_in_executor(), can't use aio there
+- Startup connection path now waits for async_ch.channel_ready(), retries registration
+  with fresh channels, and supports CLI tuning:
+  --connect-timeout, --rpc-timeout, --connect-retries, --retry-backoff,
+  --max-retry-backoff
+
+## Leader internals
+- asyncio.Lock (_lock): guards _workers dict
+- asyncio.Condition (_grad_cond): gradient sync — last worker to arrive aggregates + notifies all
+- asyncio.Event (_training_started): set when operator types 'start' or auto-start fires
+- Per-worker asyncio.Event (assignment_event): set by start_training(), unblocks GetAssignment
+- heartbeat_monitor(): background task, removes timed-out workers, handles dead-worker mid-sync
+
+## Data flow per training step
+1. Worker: forward pass → loss.backward() → compress_gradients() [Top-K per layer]
+2. Worker: ExchangeGradients RPC → sends GradientPush (worker_id, step, loss, sparse_grads)
+3. Leader: collects from all alive workers (asyncio.Condition wait loop)
+4. Leader: last worker triggers _aggregate_and_step() → weighted average → optimizer.step()
+5. Leader: serializes weight delta (new_weights - old_weights) → sends WeightUpdate
+6. Worker: apply_delta() → adds delta to model params in-place
+
+## Gradient compression
+Top-K sparsification: for each layer with gradient, keep topk_k elements by absolute value.
+Sends (indices, values, shape) tuples. Default topk_k=50000.
+Full gradient (topk_k=0) also supported.
+Gradients moved to CPU + cast float32 before sending (avoids MPS/CUDA serialization issues).
+
+## Sharding
+worker_fraction = worker_score / sum(all_scores)
+worker_samples = int(fraction × 100,000)  [Tiny ImageNet train size]
+batch_size scales proportionally (base 32, scaled by fraction, min 8, max 256)
+
+## Model
+ResNet-101 default (also supports resnet18, resnet50 via --model flag)
+Modified final FC: 200 classes (Tiny ImageNet-200)
+Initial weights serialized with torch.save() → sent as bytes in GetAssignmentResponse
+First sync: full state dict. Subsequent: weight delta only.
+
+## Tailscale
+Leader DNS: leader-macbook-pro.taila5426e.ts.net (Tailscale IP: 100.79.142.77)
+Worker DNS: devanshis-macbook-air.taila5426e.ts.net
+Both machines must be logged into same Tailscale account
+
+
+# KEY DECISIONS & CONSTRAINTS
+
+1. Parameter Server over DDP: MPS + CUDA can't use NCCL. DDP serializes on slowest.
+   PS allows heterogeneous hardware, unequal batch sizes, natural fault tolerance.
+
+2. Two gRPC channels per worker (async + sync): asyncio can't use sync grpc stubs.
+   Training thread uses run_in_executor → needs sync channel for ExchangeGradients.
+
+3. Weight delta (not full state dict) per step: reduces bandwidth from ~170 MB to ~1-10 MB.
+   Full state dict only on initial assignment.
+
+4. asyncio.Condition for gradient sync: "last worker aggregates" semantics.
+   Lock ordering: _grad_cond → _lock (never reversed to avoid deadlock).
+
+5. grpc.aio has NO sleep() function in grpc >= 1.32+ (removed from public API).
+   Must use asyncio.sleep() in async contexts, not aio.sleep().
+
+6. Leader gRPC server needs explicit message size options:
+   aio.server(options=[("grpc.max_receive_message_length", 256*1024*1024), ...])
+   Default is 4 MB which rejects ResNet gradient pushes (~6 MB per step).
+
+7. Non-interactive leader mode: when stdin is not a TTY (subprocess/CI), use
+   server.wait_for_termination() instead of cli_loop() to avoid immediate exit.
+
+8. Dataset is pre-downloaded on each worker independently (no shared filesystem).
+   Workers download to ~/.cache/tiny-imagenet-200. Script skips if already present.
+
+9. MPS device: Apple Silicon GPU. Cannot use NCCL. Supported via torch.device("mps").
+   Fallback chain: CUDA → MPS → CPU.
+
+10. gRPC SETTINGS timeout diagnosis: when nc succeeds but grpc channel_ready() times out,
+    check for duplicate/stopped leader processes with lsof/ps. On 2026-05-08 the cause
+    was two leaders bound to 50051 due to grpc port reuse; one was STAT T. Fixed in
+    leader.py via ("grpc.so_reuseport", 0). Tailscale ping and TCP were fine.
+
+
+# IMPORTANT FILES / COMMANDS / WORKFLOWS
+
+## File layout
+distributed-resnet/
+├── leader.py              # Parameter server + interactive CLI + gRPC server
+├── worker.py              # Worker: probe→register→train→push gradients
+├── hardware_probe.py      # Cross-platform HW detection + capability score
+├── dataset.py             # Tiny ImageNet-200 download, val setup, DataLoaders
+├── test_e2e.py            # End-to-end smoke test (no dataset, no Tailscale)
+├── generate_proto.sh      # Regenerate proto stubs after editing .proto
+├── requirements.txt
+├── context.txt            # THIS FILE — project memory
+├── proto/
+│   ├── trainer.proto
+│   ├── trainer_pb2.py     # generated
+│   └── trainer_pb2_grpc.py # generated
+└── scripts/
+    ├── worker_macos.sh    # Mac one-shot bootstrap
+    └── worker_windows.ps1 # Windows one-shot bootstrap
+
+## Leader commands
+cd ~/Desktop/Academic/AI_New/distributed-resnet
+python3 leader.py --min-workers 1 --model resnet101 --epochs 5
+# Interactive CLI: type 'start', 'status', 'quit'
+
+# Diagnose/kill stale leader process
+lsof -nP -iTCP:50051 -sTCP:LISTEN
+ps -o pid,stat,etime,command -p <PID>
+kill <PID>
+
+## Worker commands (Mac, from other machine)
+cd ~/distributed-resnet && git pull && LEADER_HOST=leader-macbook-pro.taila5426e.ts.net bash scripts/worker_macos.sh
+
+# One-liner (first time, no repo)
+LEADER_HOST=leader-macbook-pro.taila5426e.ts.net bash <(curl -fsSL https://raw.githubusercontent.com/Ruturaj-Vasant/Distributed_Hetrogeneous_Training/main/scripts/worker_macos.sh)
+
+## Worker commands (same machine, dry-run test)
+cd ~/Desktop/Academic/AI_New/distributed-resnet
+python3 worker.py --leader 127.0.0.1 --port 50051 --dry-run
+
+## Worker retry knobs
+python3 worker.py --leader leader-macbook-pro.taila5426e.ts.net --port 50051 --dry-run \
+  --connect-timeout 20 --rpc-timeout 30 --connect-retries 6 \
+  --retry-backoff 2 --max-retry-backoff 15
+
+## Smoke test (no extra machines needed)
+python3 test_e2e.py                    # unit-level e2e, ~15 seconds
+python3 /tmp/two_process_smoke.py      # two-process subprocess test, ~30 seconds
+
+## Proto regeneration
+./generate_proto.sh
+
+## Tailscale diagnostics
+tailscale status
+tailscale ping leader-macbook-pro.taila5426e.ts.net
+nc -zv 100.79.142.77 50051            # test TCP reachability
+lsof -i :50051                        # verify what's listening on port
+
+
+# KNOWN ISSUES / RISKS
+
+1. [FIXED IN CODE / VERIFY IN CLEAN RUN] gRPC SETTINGS timeout on Tailscale path.
+   Symptom: nc succeeds, grpc.aio.Register() or channel_ready() times out.
+   Confirmed cause on 2026-05-08: duplicate leader.py processes sharing 50051; one
+   process was stopped (STAT T). Workers could connect to the stopped listener and
+   hang before HTTP/2 SETTINGS.
+   Fixes: leader disables grpc.so_reuseport; worker waits for channel readiness,
+   retries registration, and logs clean connection failures.
+   Remaining operational step: kill currently stale listeners before starting patched leader.
+
+2. [FIXED] grpc.aio has no sleep() — heartbeat crashed silently after first beat.
+   Workers showed as DEAD ~15s after connecting because hb_task raised AttributeError.
+   Fixed: asyncio.sleep(5) in heartbeat_loop. Exception handler broadened to catch all.
+   Commit: 83dd643
+
+3. [FIXED] gRPC 4 MB message limit on leader server.
+   ResNet gradient push ~6 MB triggered RESOURCE_EXHAUSTED.
+   Fixed: aio.server(options=[("grpc.max_receive_message_length", 256*1024*1024)]).
+   Commit: 089213e
+
+4. [FIXED] Leader exited immediately in subprocess mode.
+   cli_loop() called input() which raised EOFError when stdin=DEVNULL.
+   Fixed: sys.stdin.isatty() check → use server.wait_for_termination() for non-TTY.
+
+5. [RISK] ResNet-101 full weight delta still ~44 MB per step (44,131 KB observed in smoke test).
+   For many workers or slow links this could bottleneck gradient exchange.
+   Mitigation: Top-K compression reduces gradient payload, but weight delta is still full model.
+   Future: consider sending only changed layers or using lower precision (fp16).
+
+6. [RISK] Dead worker mid-sync: heartbeat_monitor handles forced aggregation,
+   but if all workers die during a sync, the round hangs. Not fully tested.
+
+7. [RISK] No gradient synchronization across epochs — each step is independent.
+   If a worker falls behind, it gets stale weight deltas. Acceptable for now.
+
+8. [KNOWN LIMITATION] Windows bootstrap script not yet tested end-to-end on real hardware.
+   CUDA detection via nvidia-smi heuristic may need tuning for specific driver versions.
+
+9. [KNOWN LIMITATION] MPS + asyncio.run_in_executor: MPS operations in a thread pool
+   executor may have restrictions. If MPS training hangs, may need to pin to main thread.
+
+
+# PEOPLE / RESPONSIBILITIES
+
+Ruturaj Vasant (ruturaj.v.tambe@gmail.com)
+- Project owner, leader machine operator
+- MacBook Pro M3 Pro, 14 GPU cores, score≈1530
+- Leader machine Tailscale: leader-macbook-pro.taila5426e.ts.net (100.79.142.77)
+
+Devanshi (last name unknown)
+- Worker operator
+- MacBook Air M3, 10 GPU cores, score≈1103
+- Worker machine Tailscale: devanshis-macbook-air.taila5426e.ts.net
+- Repo already cloned at ~/distributed-resnet on her machine
+- Dataset already cached at ~/.cache/tiny-imagenet-200
+
+
+# RESUME HERE
+
+The system is fully implemented. Latest code fixes are committed and pushed through
+f264ba4 on main:
+- leader.py: auto-kills existing leader processes on the target port before binding
+  and disables ("grpc.so_reuseport", 0) to prevent duplicate leaders on one port.
+- worker.py: channel_ready wait, registration retry loop, retry CLI flags, clean
+  connection exhaustion errors.
+
+A clean DNS/IP dry-run worked on port 50052. The latest 50051 SETTINGS timeout was
+diagnosed as an operational stale-process problem: two leaders were listening on
+50051 and one was stopped (STAT T). TCP nc succeeded, but gRPC could hang before
+HTTP/2 SETTINGS if routed to the stopped listener.
+
+Resume by killing all current 50051 listeners, starting exactly one patched leader,
+and running the patched worker:
+  lsof -nP -iTCP:50051 -sTCP:LISTEN
+  kill <listed PIDs>
+  python3 leader.py --min-workers 1 --model resnet101 --epochs 5
+  python3 worker.py --leader leader-macbook-pro.taila5426e.ts.net --port 50051 --dry-run
+
+If using Devanshi's worker clone, make sure the local worker retry patch is available
+there via git pull after commit/push, or apply/copy the patched worker.py manually.
+
+
+# MEMORY MAINTENANCE RULES
+- This file is a living document and must be continuously updated as progress happens.
+- Never rewrite the entire file unnecessarily; update only the relevant sections.
+- Preserve historical decisions and reasoning unless explicitly deprecated.
+- Add timestamps or progress markers where useful.
+- Move completed items from "IN-PROGRESS WORK" to "COMPLETED WORK".
+- Add newly discovered blockers, assumptions, and design changes immediately.
+- Keep architecture and workflows synchronized with the actual implementation state.
+- Remove stale or invalid assumptions when they are no longer true.
+- Maintain continuity so future AI sessions can resume work without rereading old chats.
+- Prioritize accuracy and current state over polished writing.
