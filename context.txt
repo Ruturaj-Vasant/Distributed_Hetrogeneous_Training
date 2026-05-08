@@ -103,6 +103,13 @@ two-machine real test.
 11. Two-process smoke test: 10/10 checks passed (leader + worker as subprocesses,
     dry-run, resnet18, 1 epoch, port 50061)
 
+12. docs/index.html — command reference website
+    - Visual-only redesign completed; HTML content, command text, copy buttons, and
+      structure preserved.
+    - Direction: brutalist editorial/data-sheet operator manual. Uses Georgia +
+      Courier, hard black rules, paper/acid/rust/petrol palette, asymmetric command
+      slabs, no gradient hero, no rounded shadow card grid, no Inter/Poppins.
+
 All fixes committed and pushed to main:
 - 089213e: gRPC 4 MB limit + non-interactive leader mode
 - 83dd643: heartbeat aio.sleep fix + broad exception handler
@@ -260,6 +267,7 @@ distributed-resnet/
 ├── generate_proto.sh      # Regenerate proto stubs after editing .proto
 ├── requirements.txt
 ├── context.txt            # THIS FILE — project memory
+├── docs/index.html        # Static command reference website
 ├── proto/
 │   ├── trainer.proto
 │   ├── trainer_pb2.py     # generated
