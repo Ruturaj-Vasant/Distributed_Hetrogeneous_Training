@@ -37,18 +37,27 @@ def _bootstrap() -> None:
         print("[bootstrap] Creating .venv …", flush=True)
         subprocess.run([sys.executable, "-m", "venv", str(venv)], check=True)
 
-    # Install / verify dependencies.
-    probe = subprocess.run(
-        [str(venv_py), "-c", "import torch, torchvision, grpc"],
+    # Install deps only when requirements.txt changed or a core import fails.
+    req_file   = proj / "requirements.txt"
+    stamp_file = venv / ".deps_hash"
+
+    import hashlib
+    req_hash = hashlib.md5(req_file.read_bytes()).hexdigest() if req_file.exists() else ""
+    cached   = stamp_file.read_text().strip() if stamp_file.exists() else ""
+
+    probe_ok = subprocess.run(
+        [str(venv_py), "-c", "import torch, torchvision, grpc, psutil, numpy"],
         capture_output=True,
-    )
-    if probe.returncode != 0:
+    ).returncode == 0
+
+    if not probe_ok or cached != req_hash:
         print("[bootstrap] Installing dependencies …", flush=True)
         subprocess.run(
             [str(venv_py), "-m", "pip", "install",
-             "-r", str(proj / "requirements.txt"), "-q"],
+             "-r", str(req_file), "-q"],
             check=True,
         )
+        stamp_file.write_text(req_hash)
 
     # Generate gRPC proto stubs if missing.
     proto_dir = proj / "proto"
