@@ -6,7 +6,7 @@ Usage:
 
 What this script does, in order:
     1.  Probe local hardware (CPU, CUDA/MPS, RAM) and compute a capability score
-    2.  Download Tiny ImageNet-200 to ~/.cache/tiny-imagenet-200 if not present
+    2.  Download the dataset (--dataset cifar10|tinyimagenet) if not present
     3.  Connect to the leader over Tailscale and register
     4.  Start a bidirectional heartbeat stream in the background
     5.  Call GetAssignment — BLOCKS until the operator types "start" on the leader
@@ -594,11 +594,13 @@ async def run(cfg: argparse.Namespace) -> None:
     )
 
     # ── Step 2: dataset download ─────────────────────────────────────────────
-    # The actual dataset name comes from the leader's TrainingConfig, so we
-    # defer the real download until after GetAssignment.  Pre-flight check
-    # only happens in non-dry-run, post-assignment (see Step 8 below).
     if cfg.dry_run:
         log.info("Dry-run mode: skipping dataset download (synthetic data will be used)")
+    else:
+        log.info(f"Ensuring {cfg.dataset} dataset is present …")
+        await asyncio.get_event_loop().run_in_executor(
+            None, lambda: ensure_any_dataset(cfg.dataset, cfg.cache_dir)
+        )
 
     _MODEL_FNS = {
         "resnet18":  models.resnet18,
@@ -682,10 +684,6 @@ async def run(cfg: argparse.Namespace) -> None:
                         f"batch={assignment.local_batch_size}"
                     )
                 else:
-                    log.info(f"Ensuring {dataset_name} dataset …")
-                    await asyncio.get_event_loop().run_in_executor(
-                        None, lambda: ensure_any_dataset(dataset_name, cfg.cache_dir)
-                    )
                     loader = make_any_train_loader(
                         dataset    = dataset_name,
                         root       = cfg.cache_dir,
@@ -789,8 +787,12 @@ if __name__ == "__main__":
     )
     p.add_argument("--port",  type=int, default=50051)
     p.add_argument(
+        "--dataset", default="tinyimagenet", choices=["tinyimagenet", "cifar10"],
+        help="Dataset to pre-download before connecting to the leader (default: tinyimagenet)"
+    )
+    p.add_argument(
         "--cache-dir", default=None, dest="cache_dir",
-        help="Override dataset cache directory (default: ~/.cache/tiny-imagenet-200)"
+        help="Override dataset cache directory"
     )
     p.add_argument(
         "--dry-run", action="store_true", dest="dry_run",
