@@ -46,29 +46,32 @@ log = logging.getLogger("leader")
 
 # ── Tunables ──────────────────────────────────────────────────────────────────
 
-HEARTBEAT_TIMEOUT   = 15.0      # seconds of silence before worker is removed
-GRAD_SYNC_TIMEOUT   = 120.0     # max wait for all workers per gradient round
 STATUS_INTERVAL     = 10.0      # seconds between auto-printed cluster tables
 TINY_IMAGENET_TRAIN = 100_000   # total training samples in Tiny ImageNet-200
+# Heartbeat / grad-sync defaults — overridden by CLI flags at runtime
+_DEFAULT_HEARTBEAT_TIMEOUT       = 60.0
+_DEFAULT_HEARTBEAT_CHECK_INTERVAL =  5.0
+_DEFAULT_GRAD_SYNC_TIMEOUT       = 120.0
 
 
 # ── Per-worker state ──────────────────────────────────────────────────────────
 
 @dataclass
 class WorkerState:
-    worker_id:       str
-    hostname:        str
-    os_name:         str
-    score:           float
-    cpu_cores:       int
-    ram_gb:          float
-    accel_summary:   str          # human-readable: "CUDA:RTX3060@6GB | ..."
-    registered_at:   float = field(default_factory=time.monotonic)
-    last_heartbeat:  float = field(default_factory=time.monotonic)
-    status:          int   = 0    # trainer_pb2.WorkerStatus value
-    shard_indices:   list  = field(default_factory=list)
-    local_batch_size: int  = 32
-    assigned:        bool  = False
+    worker_id:         str
+    hostname:          str
+    os_name:           str
+    score:             float
+    cpu_cores:         int
+    ram_gb:            float
+    accel_summary:     str          # human-readable: "CUDA:RTX3060@6GB | ..."
+    heartbeat_timeout: float = _DEFAULT_HEARTBEAT_TIMEOUT
+    registered_at:     float = field(default_factory=time.monotonic)
+    last_heartbeat:    float = field(default_factory=time.monotonic)
+    status:            int   = 0    # trainer_pb2.WorkerStatus value
+    shard_indices:     list  = field(default_factory=list)
+    local_batch_size:  int   = 32
+    assigned:          bool  = False
 
     # asyncio primitives — created fresh per worker
     cmd_queue:        asyncio.Queue = field(default_factory=asyncio.Queue)
@@ -76,7 +79,7 @@ class WorkerState:
 
     @property
     def is_alive(self) -> bool:
-        return (time.monotonic() - self.last_heartbeat) < HEARTBEAT_TIMEOUT
+        return (time.monotonic() - self.last_heartbeat) < self.heartbeat_timeout
 
 
 # ── gRPC service ──────────────────────────────────────────────────────────────
@@ -107,9 +110,10 @@ class LeaderService(trainer_pb2_grpc.TrainerServiceServicer):
         # Gradient synchronisation across workers
         # asyncio.Condition protects _pending_grads and _grad_round.
         # Workers block in wait_for() until the round increments.
-        self._grad_cond    = asyncio.Condition()
+        self._grad_cond       = asyncio.Condition()
         self._pending_grads: dict[str, trainer_pb2.GradientPush] = {}
-        self._grad_round   = 0
+        self._grad_round      = 0
+        self._grad_round_start: float = 0.0   # monotonic time when first grad arrived this round
         self._last_payload: bytes = b""
 
     # ── RPC: Register ─────────────────────────────────────────────────────────
@@ -140,13 +144,14 @@ class LeaderService(trainer_pb2_grpc.TrainerServiceServicer):
         accel_summary = " | ".join(accel_parts) or "CPU-only"
 
         state = WorkerState(
-            worker_id     = wid,
-            hostname      = hw.hostname,
-            os_name       = hw.os,
-            score         = bm.score,
-            cpu_cores     = hw.cpu_cores,
-            ram_gb        = hw.ram_gb,
-            accel_summary = accel_summary,
+            worker_id         = wid,
+            hostname          = hw.hostname,
+            os_name           = hw.os,
+            score             = bm.score,
+            cpu_cores         = hw.cpu_cores,
+            ram_gb            = hw.ram_gb,
+            accel_summary     = accel_summary,
+            heartbeat_timeout = self.cfg.heartbeat_timeout,
         )
 
         async with self._lock:
@@ -267,10 +272,20 @@ class LeaderService(trainer_pb2_grpc.TrainerServiceServicer):
         while others are waiting, monitor also acquires _grad_cond and
         triggers aggregation with fewer workers so no one blocks forever.
         """
-        wid          = request.worker_id
+        wid = request.worker_id
+
+        # Gradient push proves the worker is alive — refresh liveness timestamp
+        # so a slow training step doesn't trigger a false heartbeat timeout.
+        async with self._lock:
+            w = self._workers.get(wid)
+            if w is not None:
+                w.last_heartbeat = time.monotonic()
+
         round_before = self._grad_round
 
         async with self._grad_cond:
+            if not self._pending_grads:
+                self._grad_round_start = time.monotonic()   # first grad this round
             self._pending_grads[wid] = request
             n_alive    = await self._count_alive()
             n_received = len(self._pending_grads)
@@ -375,7 +390,7 @@ class LeaderService(trainer_pb2_grpc.TrainerServiceServicer):
 
     async def heartbeat_monitor(self) -> None:
         while True:
-            await asyncio.sleep(5)
+            await asyncio.sleep(self.cfg.heartbeat_check_interval)
 
             async with self._lock:
                 dead = [w for w in self._workers.values() if not w.is_alive]
@@ -383,17 +398,33 @@ class LeaderService(trainer_pb2_grpc.TrainerServiceServicer):
                     log.warning(f"[-] Worker {w.worker_id} ({w.hostname}) timed out.")
                     del self._workers[w.worker_id]
 
-            # If workers died mid-training, the remaining workers may be
-            # blocked in wait_for() forever — release them now.
-            if dead and self._training_started.is_set():
+            if self._training_started.is_set():
                 async with self._grad_cond:
                     n_alive    = await self._count_alive()
                     n_received = len(self._pending_grads)
-                    if 0 < n_received >= n_alive:
-                        log.info(
-                            f"Forcing gradient aggregation after {len(dead)} "
-                            f"worker(s) removed (have {n_received}/{n_alive})."
+
+                    should_force = False
+                    reason = ""
+
+                    # Case 1: workers died and remaining grads are enough to proceed
+                    if dead and 0 < n_received >= n_alive:
+                        should_force = True
+                        reason = f"{len(dead)} worker(s) removed ({n_received}/{n_alive} grads)"
+
+                    # Case 2: grad round has been stuck longer than grad_sync_timeout
+                    elif (n_received > 0
+                          and self._grad_round_start > 0
+                          and (time.monotonic() - self._grad_round_start)
+                              > self.cfg.grad_sync_timeout):
+                        should_force = True
+                        age = time.monotonic() - self._grad_round_start
+                        reason = (
+                            f"sync timeout {age:.0f}s > {self.cfg.grad_sync_timeout}s "
+                            f"({n_received}/{n_alive} grads)"
                         )
+
+                    if should_force:
+                        log.warning(f"Forcing gradient aggregation: {reason}")
                         await asyncio.get_event_loop().run_in_executor(
                             None, self._aggregate_and_step
                         )
@@ -689,6 +720,11 @@ async def main(cfg: argparse.Namespace) -> None:
     log.info(f"Min workers    : {cfg.min_workers}")
     log.info(f"Auto-start     : {cfg.auto_start}")
     log.info(f"Device (leader): {service._device}")
+    log.info(
+        f"Timeouts       : heartbeat={cfg.heartbeat_timeout}s  "
+        f"check={cfg.heartbeat_check_interval}s  "
+        f"grad_sync={cfg.grad_sync_timeout}s"
+    )
 
     asyncio.create_task(service.heartbeat_monitor())
     asyncio.create_task(service.status_printer())
@@ -727,5 +763,15 @@ if __name__ == "__main__":
                    help="Top-K gradient elements per layer (0 = full gradients)")
     p.add_argument("--model",        default="resnet101", dest="model_name",
                    choices=["resnet18", "resnet50", "resnet101"])
+    p.add_argument("--heartbeat-timeout", type=float, default=_DEFAULT_HEARTBEAT_TIMEOUT,
+                   dest="heartbeat_timeout",
+                   help="Seconds of silence before a worker is marked dead (default 60)")
+    p.add_argument("--heartbeat-check-interval", type=float,
+                   default=_DEFAULT_HEARTBEAT_CHECK_INTERVAL,
+                   dest="heartbeat_check_interval",
+                   help="How often to check for dead workers in seconds (default 5)")
+    p.add_argument("--grad-sync-timeout", type=float, default=_DEFAULT_GRAD_SYNC_TIMEOUT,
+                   dest="grad_sync_timeout",
+                   help="Max seconds to wait for all workers per gradient round (default 120)")
     cfg = p.parse_args()
     asyncio.run(main(cfg))

@@ -57,15 +57,18 @@ FAIL = "\033[91m✗\033[0m"
 
 def _make_cfg(**overrides) -> argparse.Namespace:
     defaults = dict(
-        min_workers  = 1,
-        auto_start   = False,
-        epochs       = 1,
-        num_classes  = N_CLASSES,
-        lr           = 0.01,
-        weight_decay = 1e-4,
-        topk         = 200,        # small for speed; covers a resnet18 conv layer
-        model_name   = "resnet18", # fast: ~45MB vs 170MB for resnet101
-        port         = TEST_PORT,
+        min_workers              = 1,
+        auto_start               = False,
+        epochs                   = 1,
+        num_classes              = N_CLASSES,
+        lr                       = 0.01,
+        weight_decay             = 1e-4,
+        topk                     = 200,        # small for speed; covers a resnet18 conv layer
+        model_name               = "resnet18", # fast: ~45MB vs 170MB for resnet101
+        port                     = TEST_PORT,
+        heartbeat_timeout        = 60.0,
+        heartbeat_check_interval =  5.0,
+        grad_sync_timeout        = 120.0,
     )
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
