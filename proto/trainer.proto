@@ -101,6 +101,7 @@ message TrainingConfig {
   float  base_lr          = 5;
   float  weight_decay     = 6;
   int32  gradient_topk_k  = 7;  // top-K for gradient compression (0 = no compression)
+  int32  grad_accum_steps = 8;  // gradient accumulation steps (1 = sync every batch)
 }
 
 // Worker calls GetAssignment after registering.

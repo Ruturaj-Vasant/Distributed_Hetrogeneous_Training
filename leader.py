@@ -386,13 +386,14 @@ class LeaderService(trainer_pb2_grpc.TrainerServiceServicer):
         await asyncio.get_event_loop().run_in_executor(None, self._init_model)
 
         self._training_cfg = trainer_pb2.TrainingConfig(
-            model_name      = getattr(self.cfg, "model_name", "resnet101"),
-            dataset         = "tiny_imagenet_200",
-            num_classes     = self.cfg.num_classes,
-            total_epochs    = self.cfg.epochs,
-            base_lr         = self.cfg.lr,
-            weight_decay    = self.cfg.weight_decay,
-            gradient_topk_k = self.cfg.topk,
+            model_name       = getattr(self.cfg, "model_name", "resnet101"),
+            dataset          = "tiny_imagenet_200",
+            num_classes      = self.cfg.num_classes,
+            total_epochs     = self.cfg.epochs,
+            base_lr          = self.cfg.lr,
+            weight_decay     = self.cfg.weight_decay,
+            gradient_topk_k  = self.cfg.topk,
+            grad_accum_steps = getattr(self.cfg, "grad_accum", 1),
         )
 
         self._training_started.set()
@@ -729,8 +730,13 @@ class LeaderService(trainer_pb2_grpc.TrainerServiceServicer):
                 + (f"\n          {parts_str}" if len(arrivals) > 1 else "")
             )
 
-        # Epoch tracking (approximate — assumes all workers finish same #steps)
-        steps_per_epoch = max(1, TINY_IMAGENET_TRAIN // (32 * max(1, len(grads))))
+        # Epoch tracking — accounts for grad accumulation reducing sync count
+        grad_accum      = getattr(self.cfg, "grad_accum", 1)
+        batch_size      = getattr(self.cfg, "batch_size", 32)
+        steps_per_epoch = max(
+            1,
+            TINY_IMAGENET_TRAIN // (batch_size * max(1, len(grads)) * grad_accum),
+        )
         self._current_epoch = self._global_step // steps_per_epoch
 
         if self._recorder:
@@ -934,6 +940,8 @@ if __name__ == "__main__":
                    help="Base batch size per worker (scales proportionally with score, default 32)")
     p.add_argument("--topk",         type=int,   default=50_000,
                    help="Top-K gradient elements per layer (0 = full gradients)")
+    p.add_argument("--grad-accum",   type=int,   default=1, dest="grad_accum",
+                   help="Gradient accumulation steps — sync every N batches (default 1)")
     p.add_argument("--model",        default="resnet101", dest="model_name",
                    choices=["resnet18", "resnet50", "resnet101"])
     p.add_argument("--heartbeat-timeout", type=float, default=_DEFAULT_HEARTBEAT_TIMEOUT,
