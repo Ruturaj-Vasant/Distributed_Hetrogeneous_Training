@@ -1,98 +1,216 @@
 """
-watch_cluster.py  —  Live cluster monitor + worker admission control
+watch_cluster.py — Live cluster monitor + worker admission control
 
 Usage:
-    python3 watch_cluster.py [--leader leader-macbook-pro.taila5426e.ts.net] [--port 50051]
+    python3 watch_cluster.py [--leader <host>] [--port 50051] [--interval 5]
 
-Displays live status and accepts commands:
-    admit <id>   — admit a specific pending worker into the running training
-    admit all    — admit every pending worker at once
-    quit         — exit
+Two-panel display:
+    Top:    Admitted workers (active training participants)
+    Bottom: Pending workers (waiting for admission)
+
+Commands at the cmd> prompt:
+    admit <id> [id ...]  — admit specific pending worker(s)
+    admit all            — admit every pending worker
+    r / refresh          — force a display refresh
+    quit / q             — exit
 """
 from __future__ import annotations
 
 import argparse
-import os
+import queue
 import select
 import sys
+import threading
 import time
 
 import grpc
 
 from proto import trainer_pb2, trainer_pb2_grpc
 
-_DIV = "─" * 88
+from rich.console import Console, Group
+from rich.live import Live
+from rich.panel import Panel
+from rich.rule import Rule
+from rich.table import Table
+from rich.text import Text
+from rich import box
+
+# ── Constants ─────────────────────────────────────────────────────────────────
+
+_ALIVE_SECS  = 30     # seconds without heartbeat before worker is "disconnected"
+_PAD_ADMITTED = 4     # minimum rows in the admitted table (keeps height stable)
+_PAD_PENDING  = 3     # minimum rows in the pending table
+
+# ── Rich helpers ──────────────────────────────────────────────────────────────
+
+def _age_cell(last_seen_ts: int) -> Text:
+    age = max(0, int(time.time()) - last_seen_ts)
+    if age < _ALIVE_SECS:
+        return Text(f"{age}s", style="green")
+    if age < 120:
+        return Text(f"silent {age}s", style="yellow")
+    return Text(f"DEAD {age}s", style="red bold")
 
 
-def _clear() -> None:
-    os.system("cls" if sys.platform == "win32" else "clear")
+def _status_cell(status: int, last_seen_ts: int) -> Text:
+    age = max(0, int(time.time()) - last_seen_ts)
+    if age >= _ALIVE_SECS:
+        return Text("disconnected", style="red bold")
+    label, style = {
+        0: ("idle",        "white"),
+        1: ("training",    "green bold"),
+        2: ("downloading", "yellow"),
+        3: ("error",       "red"),
+    }.get(status, (str(status), "white"))
+    return Text(label, style=style)
 
 
-def _status_table(resp) -> str:
-    workers = resp.workers
+# ── Table builders ────────────────────────────────────────────────────────────
+
+def _admitted_table(workers) -> Table:
+    t = Table(
+        box=box.SIMPLE_HEAD,
+        header_style="bold cyan",
+        expand=True,
+        show_edge=False,
+        padding=(0, 1),
+    )
+    t.add_column("Worker ID",  style="cyan",  no_wrap=True, min_width=10)
+    t.add_column("Hostname",   no_wrap=True,  min_width=22)
+    t.add_column("Score",      justify="right", min_width=6)
+    t.add_column("Shard %",    justify="right", min_width=7)
+    t.add_column("Status",     min_width=14)
+    t.add_column("Last Seen",  justify="right", min_width=11)
+
     if not workers:
-        return "  (no active workers)\n"
-
-    lines = [_DIV]
-    lines.append(
-        f"  {'ID':<10} {'HOSTNAME':<28} {'SCORE':>8} "
-        f"{'SHARD':>7} {'STATUS':<12} ACCEL"
-    )
-    lines.append(_DIV)
-
-    status_names = {0: "idle", 1: "training", 2: "downloading", 3: "error"}
-    for w in workers:
-        age    = int(time.time()) - w.last_seen_ts
-        alive  = "alive" if age < 30 else f"silent {age}s"
-        status = status_names.get(w.status, str(w.status))
-        lines.append(
-            f"  {w.worker_id:<10} {w.hostname:<28} {w.score:>8.1f} "
-            f"{w.shard_pct:>6.1f}%  {alive:<12}"
-        )
-    lines.append(_DIV)
-    lines.append(
-        f"  Step={resp.global_step:>6,}  "
-        f"Epoch={resp.current_epoch:>3}  "
-        f"Loss={resp.global_loss:.4f}  "
-        f"Active workers={len(workers)}"
-    )
-    return "\n".join(lines)
-
-
-def _pending_table(pending, training_started: bool) -> str:
-    if not pending:
-        return ""
-    if training_started:
-        header = "PENDING WORKERS — admit to trigger Phase-2 shard rebalancing"
-        footer = f"  admit all  |  admit {pending[0].worker_id}  (triggers reshard on active workers)"
+        t.add_row("[dim]—[/dim]", "[dim]no admitted workers yet[/dim]",
+                  "", "", "", "")
+        for _ in range(_PAD_ADMITTED - 1):
+            t.add_row("", "", "", "", "", "")
     else:
-        header = "PENDING WORKERS — admit the ones you want, then type 'start' on leader"
-        footer = f"  admit all  |  admit {pending[0].worker_id}  (admitted workers join at 'start')"
-    lines = ["", f"  {header:^86}", _DIV]
-    lines.append(
-        f"  {'ID':<10} {'HOSTNAME':<28} {'SCORE':>8} {'WAITING':>9}  ACCEL"
+        for w in workers:
+            t.add_row(
+                w.worker_id,
+                w.hostname,
+                f"{w.score:.0f}",
+                f"{w.shard_pct:.1f}%",
+                _status_cell(w.status, w.last_seen_ts),
+                _age_cell(w.last_seen_ts),
+            )
+        for _ in range(max(0, _PAD_ADMITTED - len(workers))):
+            t.add_row("", "", "", "", "", "")
+    return t
+
+
+def _pending_table(pending) -> Table:
+    t = Table(
+        box=box.SIMPLE_HEAD,
+        header_style="bold yellow",
+        expand=True,
+        show_edge=False,
+        padding=(0, 1),
     )
-    lines.append(_DIV)
-    for w in pending:
-        wait = f"{w.waiting_seconds}s"
-        lines.append(
-            f"  {w.worker_id:<10} {w.hostname:<28} {w.score:>8.1f} {wait:>9}  {w.accel_summary}"
+    t.add_column("Worker ID", style="cyan", no_wrap=True, min_width=10)
+    t.add_column("Hostname",  no_wrap=True, min_width=22)
+    t.add_column("Score",     justify="right", min_width=6)
+    t.add_column("Waiting",   justify="right", min_width=8)
+    t.add_column("Accel",     min_width=20)
+
+    if not pending:
+        t.add_row("[dim]—[/dim]", "[dim]no pending workers[/dim]",
+                  "", "", "")
+        for _ in range(_PAD_PENDING - 1):
+            t.add_row("", "", "", "", "")
+    else:
+        for w in pending:
+            t.add_row(
+                w.worker_id,
+                w.hostname,
+                f"{w.score:.0f}",
+                f"{w.waiting_seconds}s",
+                w.accel_summary,
+            )
+        for _ in range(max(0, _PAD_PENDING - len(pending))):
+            t.add_row("", "", "", "", "")
+    return t
+
+
+# ── Full renderable ───────────────────────────────────────────────────────────
+
+def _build_display(resp, addr: str) -> Group:
+    n_admitted = len(resp.workers)
+    n_pending  = len(resp.pending_workers)
+
+    admitted_panel = Panel(
+        _admitted_table(resp.workers),
+        title=f"[cyan bold] Admitted Workers ({n_admitted}) [/cyan bold]",
+        border_style="cyan",
+    )
+
+    pending_panel = Panel(
+        _pending_table(resp.pending_workers),
+        title=f"[yellow bold] Pending Workers ({n_pending}) [/yellow bold]",
+        border_style="yellow",
+    )
+
+    # Status bar
+    if resp.training_started:
+        status = (
+            f"[green]● TRAINING[/green]  "
+            f"Step [bold]{resp.global_step:,}[/bold]  "
+            f"Epoch [bold]{resp.current_epoch}[/bold]  "
+            f"Loss [bold]{resp.global_loss:.4f}[/bold]"
         )
-    lines.append(_DIV)
-    lines.append(f"  {footer}")
-    return "\n".join(lines)
+    else:
+        status = "[yellow]● WAITING — type [bold]start[/bold] on the leader terminal[/yellow]"
+
+    status_line = Text.from_markup(
+        f"  {status}   [dim]{addr}   {time.strftime('%H:%M:%S')}[/dim]"
+    )
+
+    # Quick-admit commands so user never has to copy-paste IDs manually
+    if resp.pending_workers:
+        parts = ["[bold yellow]admit all[/bold yellow]"] + [
+            f"[yellow]admit {w.worker_id}[/yellow]"
+            for w in resp.pending_workers
+        ]
+        hint = "  Quick:  " + "   |   ".join(parts)
+    elif resp.training_started and n_admitted == 0:
+        hint = "  [red]No active workers — training may be stalled.[/red]"
+    else:
+        hint = ""
+
+    hint_line = Text.from_markup(hint) if hint else Text("")
+
+    cmd_hint = Text.from_markup(
+        "  [dim]admit <id> | admit all | r = refresh | q = quit[/dim]"
+    )
+
+    return Group(
+        admitted_panel,
+        pending_panel,
+        status_line,
+        hint_line,
+        cmd_hint,
+        Text(""),   # spacer so cmd> prompt below has breathing room
+    )
 
 
-def _process_command(line: str, stub: trainer_pb2_grpc.TrainerServiceStub) -> None:
+# ── Command processing ────────────────────────────────────────────────────────
+
+def _process_command(
+    line: str,
+    stub: trainer_pb2_grpc.TrainerServiceStub,
+    console: Console,
+) -> None:
     parts = line.strip().split()
     if not parts:
         return
     cmd = parts[0].lower()
 
     if cmd == "admit":
-        # "admit all" or "admit <id> [id ...]"
         if not parts[1:] or parts[1].lower() == "all":
-            ids = []   # empty = admit all
+            ids   = []
             label = "all pending"
         else:
             ids   = parts[1:]
@@ -104,71 +222,139 @@ def _process_command(line: str, stub: trainer_pb2_grpc.TrainerServiceStub) -> No
                 timeout=5.0,
             )
             if resp.admitted_count:
-                print(f"\n  Admitted {resp.admitted_count} worker(s): {list(resp.admitted_ids)}")
+                console.print(
+                    f"  [green]✓ Admitted {resp.admitted_count} worker(s):"
+                    f" {list(resp.admitted_ids)}[/green]"
+                )
             else:
-                print(f"\n  No workers admitted (requested: {label})")
+                console.print(f"  [yellow]No workers admitted (requested: {label})[/yellow]")
             if resp.not_found_ids:
-                print(f"  Not found / already active: {list(resp.not_found_ids)}")
+                console.print(
+                    f"  [yellow]Not found / already active:"
+                    f" {list(resp.not_found_ids)}[/yellow]"
+                )
         except grpc.RpcError as e:
-            print(f"\n  AdmitWorkers failed: {e.code().name} — {e.details()}")
+            console.print(f"  [red]AdmitWorkers failed: {e.code().name} — {e.details()}[/red]")
 
     elif cmd in ("quit", "q", "exit"):
-        print("\nBye.")
+        console.print("\n  Bye.")
         sys.exit(0)
 
+    elif cmd in ("r", "refresh"):
+        pass  # caller will refresh on next iteration
+
     else:
-        print(f"\n  Unknown command: {cmd!r}")
-        print("  Commands: admit [id ...] | admit all | quit")
+        console.print(f"  [red]Unknown command:[/red] {cmd!r}")
+        console.print("  Commands: admit [id …] | admit all | r | quit")
+
+
+# ── Input thread ──────────────────────────────────────────────────────────────
+
+def _start_input_thread(cmd_q: queue.Queue) -> None:
+    """Daemon thread: reads lines from stdin and puts them into cmd_q."""
+    def _reader():
+        while True:
+            try:
+                line = sys.stdin.readline()
+                if not line:
+                    break
+                cmd_q.put(line.strip())
+            except Exception:
+                break
+    t = threading.Thread(target=_reader, daemon=True)
+    t.start()
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def _unreachable(addr: str) -> Text:
+    return Text.from_markup(
+        f"  [red]Leader unreachable[/red]  [dim]{addr}  {time.strftime('%H:%M:%S')}[/dim]"
+    )
 
 
 def main() -> None:
     p = argparse.ArgumentParser(description="Live cluster monitor with worker admission")
     p.add_argument("--leader",   default="leader-macbook-pro.taila5426e.ts.net")
     p.add_argument("--port",     type=int,   default=50051)
-    p.add_argument("--interval", type=float, default=3.0,
-                   help="Refresh interval in seconds (default 3)")
+    p.add_argument("--interval", type=float, default=5.0,
+                   help="Auto-refresh interval in seconds (default 5)")
     cfg = p.parse_args()
 
-    addr = f"{cfg.leader}:{cfg.port}"
-    ch   = grpc.insecure_channel(addr, options=[
+    addr    = f"{cfg.leader}:{cfg.port}"
+    ch      = grpc.insecure_channel(addr, options=[
         ("grpc.max_receive_message_length", 4 * 1024 * 1024),
     ])
-    stub = trainer_pb2_grpc.TrainerServiceStub(ch)
+    stub    = trainer_pb2_grpc.TrainerServiceStub(ch)
+    console = Console()
+    cmd_q: queue.Queue[str] = queue.Queue()
 
-    print(f"Watching {addr}  (Ctrl-C or 'quit' to exit)\n")
+    _start_input_thread(cmd_q)
 
-    while True:
-        try:
-            resp = stub.GetClusterStatus(
-                trainer_pb2.ClusterStatusRequest(), timeout=5.0
-            )
-            _clear()
-            print(f"  Cluster  [{time.strftime('%H:%M:%S')}]  {addr}\n")
-            print(_status_table(resp))
-            if resp.pending_workers:
-                print(_pending_table(resp.pending_workers, resp.training_started))
-        except grpc.RpcError as e:
-            _clear()
-            print(f"  [{time.strftime('%H:%M:%S')}] Leader unreachable: {e.code().name}")
-        except KeyboardInterrupt:
-            print("\nBye.")
-            break
+    console.print(
+        f"\n  Watching [bold]{addr}[/bold]\n"
+        f"  [dim]Type commands below the display  "
+        f"(admit all | admit <id> | r = refresh | q = quit)[/dim]\n"
+    )
 
-        # Non-blocking input: wait up to --interval seconds for a command.
-        # Falls back to dumb sleep on Windows (no select on stdin there).
-        print(f"\n  cmd> ", end="", flush=True)
-        try:
-            if sys.platform == "win32":
-                time.sleep(cfg.interval)
-            else:
-                ready, _, _ = select.select([sys.stdin], [], [], cfg.interval)
-                if ready:
-                    line = sys.stdin.readline()
-                    _process_command(line, stub)
-        except KeyboardInterrupt:
-            print("\nBye.")
-            break
+    # Fetch initial status
+    try:
+        resp = stub.GetClusterStatus(trainer_pb2.ClusterStatusRequest(), timeout=5.0)
+        initial = _build_display(resp, addr)
+    except grpc.RpcError:
+        initial = _unreachable(addr)
+
+    with Live(
+        initial,
+        console=console,
+        refresh_per_second=0,    # manual updates only — no flicker
+        transient=False,
+        vertical_overflow="visible",
+    ) as live:
+
+        last_refresh = time.monotonic()
+
+        while True:
+            # ── Drain command queue (non-blocking) ────────────────────────
+            processed_cmd = False
+            while True:
+                try:
+                    line = cmd_q.get_nowait()
+                except queue.Empty:
+                    break
+
+                if not line:
+                    continue
+                if line.lower() in ("q", "quit", "exit"):
+                    live.stop()
+                    console.print("\n  Bye.")
+                    sys.exit(0)
+
+                _process_command(line, stub, console)
+                processed_cmd = True
+
+            # ── Refresh display (after command or on interval) ────────────
+            now = time.monotonic()
+            if processed_cmd or (now - last_refresh >= cfg.interval):
+                try:
+                    resp = stub.GetClusterStatus(
+                        trainer_pb2.ClusterStatusRequest(), timeout=5.0
+                    )
+                    live.update(_build_display(resp, addr))
+                except grpc.RpcError as e:
+                    live.update(_unreachable(addr))
+                last_refresh = time.monotonic()
+
+            # Sleep until next check — wake early if a command arrives
+            try:
+                line = cmd_q.get(timeout=min(0.25, cfg.interval))
+                cmd_q.put(line)   # put back so it's processed on next iteration
+            except queue.Empty:
+                pass
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n  Bye.")

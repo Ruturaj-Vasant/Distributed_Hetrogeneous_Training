@@ -384,9 +384,13 @@ class LeaderService(trainer_pb2_grpc.TrainerServiceServicer):
         context,
     ) -> trainer_pb2.ClusterStatusResponse:
         async with self._lock:
-            workers = list(self._workers.values())
+            workers     = list(self._workers.values())
+            pending_ids = set(self._pending_worker_ids)
 
-        total_samples = sum(len(w.shard_indices) for w in workers) or 1
+        now_wall     = time.time()
+        now_mono     = time.monotonic()
+        admitted     = [w for w in workers if w.worker_id not in pending_ids]
+        total_samples = sum(len(w.shard_indices) for w in admitted) or 1
         summaries = [
             trainer_pb2.WorkerSummary(
                 worker_id    = w.worker_id,
@@ -394,9 +398,9 @@ class LeaderService(trainer_pb2_grpc.TrainerServiceServicer):
                 score        = w.score,
                 status       = w.status,
                 shard_pct    = len(w.shard_indices) / total_samples * 100,
-                last_seen_ts = int(w.last_heartbeat),
+                last_seen_ts = int(now_wall - (now_mono - w.last_heartbeat)),
             )
-            for w in workers
+            for w in admitted
         ]
         pending = [
             trainer_pb2.PendingWorkerInfo(
@@ -404,10 +408,10 @@ class LeaderService(trainer_pb2_grpc.TrainerServiceServicer):
                 hostname        = w.hostname,
                 score           = w.score,
                 accel_summary   = w.accel_summary,
-                waiting_seconds = int(time.monotonic() - w.registered_at),
+                waiting_seconds = int(now_mono - w.registered_at),
             )
-            for wid, w in self._workers.items()
-            if wid in self._pending_worker_ids
+            for w in workers
+            if w.worker_id in pending_ids
         ]
 
         return trainer_pb2.ClusterStatusResponse(
