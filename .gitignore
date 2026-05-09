@@ -31,3 +31,4 @@ checkpoints/
 *.swp
 
 runs/
+logs/

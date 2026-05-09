@@ -1,44 +1,66 @@
-# worker_windows.ps1  —  One-shot bootstrap + launch for a Windows worker node
+# worker_windows.ps1 - Bootstrap and launch a Windows worker node.
 #
-# Usage (run in PowerShell as Administrator for first-time installs):
-#   $env:LEADER_HOST="leader-macbook-pro.taila5426e.ts.net"; .\scripts\worker_windows.ps1
+# Typical usage from the repository root:
+#   powershell -ExecutionPolicy Bypass -File .\scripts\worker_windows.ps1
 #
-# What this script does:
-#   1.  Ensures winget is available
-#   2.  Installs Git (if missing)
-#   3.  Installs Python 3.11 (if missing)
-#   4.  Installs / authenticates Tailscale (if missing)
-#   5.  Clones the repo (or pulls latest if already cloned)
-#   6.  Creates a Python virtual environment
-#   7.  Installs all Python dependencies
-#       - Detects NVIDIA GPU and installs CUDA-enabled PyTorch automatically
-#       - Falls back to CPU-only PyTorch if no GPU is found
-#   8.  Generates gRPC proto stubs
-#   9.  Downloads Tiny ImageNet-200 dataset (~236 MB, skipped if cached)
-#  10.  Runs the worker
+# Useful options:
+#   -LeaderHost <host>     Leader Tailscale DNS name or IP.
+#   -LeaderPort <port>     Leader gRPC port.
+#   -SkipDataset           Do not pre-download the dataset.
+#   -SkipTailscale         Do not install/authenticate Tailscale.
+#   -DryRun                Tell worker.py to use synthetic data.
+#   -SetupOnly             Install/check dependencies, then exit before worker.py.
+#   -NoInstall             Fail with instructions instead of installing missing tools.
 #
-# Environment variables (all optional):
-#   LEADER_HOST  — leader Tailscale DNS or IP  (default: leader-macbook-pro.taila5426e.ts.net)
-#   LEADER_PORT  — gRPC port                   (default: 50051)
-#   REPO_URL     — git clone URL
-#   REPO_DIR     — local clone path             (default: $HOME\distributed-resnet)
-#   SKIP_DATASET — set to "1" to skip dataset download
+# Environment variable equivalents are also supported:
+#   LEADER_HOST, LEADER_PORT, REPO_URL, REPO_DIR, DATASET, CACHE_DIR,
+#   CONNECT_RETRIES,
+#   SKIP_DATASET=1, SKIP_TAILSCALE=1, DRY_RUN=1, WORKER_SETUP_ONLY=1,
+#   WORKER_NO_INSTALL=1, UPDATE_REPO=1, WORKER_NO_BROWSER=1
+
+[CmdletBinding()]
+param(
+    [string]$LeaderHost,
+    [int]$LeaderPort = 0,
+    [string]$RepoUrl,
+    [string]$RepoDir,
+    [string]$Dataset,
+    [string]$CacheDir,
+    [int]$ConnectRetries = 0,
+    [switch]$SkipDataset,
+    [switch]$SkipTailscale,
+    [switch]$DryRun,
+    [switch]$SetupOnly,
+    [switch]$NoInstall,
+    [switch]$UpdateRepo,
+    [Parameter(ValueFromRemainingArguments = $true)]
+    [string[]]$WorkerArgs
+)
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
-$LeaderHost  = if ($env:LEADER_HOST)  { $env:LEADER_HOST  } else { "leader-macbook-pro.taila5426e.ts.net" }
-$LeaderPort  = if ($env:LEADER_PORT)  { $env:LEADER_PORT  } else { "50051" }
-$RepoUrl     = if ($env:REPO_URL)     { $env:REPO_URL     } else { "https://github.com/Ruturaj-Vasant/Distributed_Hetrogeneous_Training.git" }
-$RepoDir     = if ($env:REPO_DIR)     { $env:REPO_DIR     } else { Join-Path $HOME "distributed-resnet" }
-$VenvDir     = Join-Path $RepoDir ".venv"
-$SkipDataset = if ($env:SKIP_DATASET) { $env:SKIP_DATASET } else { "0" }
+function Test-Truthy {
+    param([string]$Value)
+    return $Value -match '^(1|true|yes|y|on)$'
+}
 
-# ── Logging ───────────────────────────────────────────────────────────────────
+function First-Value {
+    param([object[]]$Values)
+    foreach ($value in $Values) {
+        if ($null -ne $value -and "$value".Trim() -ne "") { return "$value" }
+    }
+    return $null
+}
 
 function Write-Step {
     param([string]$Msg)
     Write-Host "[worker:win] $Msg" -ForegroundColor Cyan
+}
+
+function Write-Warn {
+    param([string]$Msg)
+    Write-Host "[worker:win] WARNING: $Msg" -ForegroundColor Yellow
 }
 
 function Write-Err {
@@ -47,83 +69,133 @@ function Write-Err {
     exit 1
 }
 
-function Refresh-Path {
-    $parts = @(
-        [Environment]::GetEnvironmentVariable("Path", "Machine"),
-        [Environment]::GetEnvironmentVariable("Path", "User")
-    ) | Where-Object { $_ }
-    $env:Path = $parts -join ";"
-}
-
 function Get-Cmd {
     param([string]$Name)
-    $c = Get-Command $Name -ErrorAction SilentlyContinue
-    if ($c) { return $c.Source }
+    $cmd = Get-Command $Name -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
     return $null
 }
 
-function Invoke-Ok {
-    param([string]$Exe, [string[]]$Arguments, [int[]]$OkCodes = @(0))
-    $resolved = if (Test-Path $Exe) { $Exe } else { Get-Cmd $Exe }
-    if (-not $resolved) { throw "Not found: $Exe" }
-    & "$resolved" @Arguments 2>&1 | ForEach-Object { Write-Host $_ }
-    if ($LASTEXITCODE -notin $OkCodes) { throw "Exit $LASTEXITCODE : $resolved $($Arguments -join ' ')" }
+function Refresh-Path {
+    $paths = New-Object System.Collections.Generic.List[string]
+    foreach ($scope in @("Machine", "User", "Process")) {
+        $raw = [Environment]::GetEnvironmentVariable("Path", $scope)
+        if (-not $raw) { continue }
+        foreach ($part in ($raw -split ";")) {
+            $trimmed = $part.Trim()
+            if ($trimmed -and -not $paths.Contains($trimmed)) {
+                [void]$paths.Add($trimmed)
+            }
+        }
+    }
+    $env:Path = $paths -join ";"
 }
 
-# ── Step 1: winget ────────────────────────────────────────────────────────────
+function Invoke-Ok {
+    param(
+        [string]$Exe,
+        [string[]]$Arguments,
+        [int[]]$OkCodes = @(0)
+    )
+    $resolved = if (Test-Path -LiteralPath $Exe) { $Exe } else { Get-Cmd $Exe }
+    if (-not $resolved) { throw "Not found: $Exe" }
+
+    & "$resolved" @Arguments 2>&1 | ForEach-Object { Write-Host $_ }
+    if ($LASTEXITCODE -notin $OkCodes) {
+        throw "Exit $LASTEXITCODE : $resolved $($Arguments -join ' ')"
+    }
+}
+
+function Test-PythonImports {
+    param(
+        [string]$PythonExe,
+        [string]$ImportCode
+    )
+    $oldPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        & "$PythonExe" -c $ImportCode *> $null
+        return $LASTEXITCODE -eq 0
+    } catch {
+        return $false
+    } finally {
+        $ErrorActionPreference = $oldPreference
+    }
+}
 
 function Ensure-Winget {
-    if (Get-Cmd "winget.exe") { Write-Step "winget already present"; return }
-    Write-Step "Installing winget (Microsoft App Installer) …"
-    $pkg = Join-Path $env:TEMP "AppInstaller.msixbundle"
+    if (Get-Cmd "winget.exe") {
+        Write-Step "winget already present"
+        return
+    }
+    if ($NoInstallFlag) {
+        Write-Err "winget is not installed. Install Microsoft App Installer, then re-run."
+    }
+
+    Write-Step "Installing winget (Microsoft App Installer)"
+    $pkg = Join-Path $env:TEMP "Microsoft.DesktopAppInstaller.msixbundle"
     Invoke-WebRequest -Uri "https://aka.ms/getwinget" -OutFile $pkg
     Add-AppxPackage -Path $pkg
     Refresh-Path
-    if (-not (Get-Cmd "winget.exe")) { Write-Err "winget install failed. Install App Installer from the Microsoft Store, then re-run." }
+
+    if (-not (Get-Cmd "winget.exe")) {
+        Write-Err "winget install failed. Install App Installer from the Microsoft Store, then re-run."
+    }
 }
 
 function Ensure-WingetPkg {
-    param([string]$Cmd, [string]$PkgId)
-    if (Get-Cmd $Cmd) { Write-Step "$Cmd already present"; return }
-    Write-Step "Installing $PkgId via winget …"
-    # -1978335189 = APPINSTALLER_CLI_ERROR_UPDATE_NOT_APPLICABLE (already at latest version — OK)
-    Invoke-Ok "winget.exe" @("install","--id",$PkgId,"--exact","--accept-source-agreements","--accept-package-agreements","--silent") -OkCodes @(0, -1978335189)
+    param(
+        [string]$Cmd,
+        [string]$PkgId,
+        [string]$FriendlyName
+    )
+    if (Get-Cmd $Cmd) {
+        Write-Step "$FriendlyName already present"
+        return
+    }
+    if ($NoInstallFlag) {
+        Write-Err "$FriendlyName is missing. Install $PkgId or re-run without -NoInstall."
+    }
+
+    Ensure-Winget
+    Write-Step "Installing $FriendlyName via winget"
+    Invoke-Ok "winget.exe" @(
+        "install", "--id", $PkgId, "--exact",
+        "--accept-source-agreements", "--accept-package-agreements", "--silent"
+    ) -OkCodes @(0, -1978335189)
     Refresh-Path
 }
 
-# ── Step 2: Git ───────────────────────────────────────────────────────────────
-# (handled via Ensure-WingetPkg in Main)
-
-# ── Step 3: Python 3.11 ───────────────────────────────────────────────────────
-
 function Find-Python311 {
-    # Strategy 1: Python Launcher (py -3.11) — the standard Windows mechanism
-    $pyLauncher = @((Get-Cmd "py.exe"), "$env:SystemRoot\py.exe", "$env:SystemRoot\System32\py.exe") |
-        Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
-    if ($pyLauncher) {
+    $pyLaunchers = @(
+        (Get-Cmd "py.exe"),
+        (Join-Path $env:SystemRoot "py.exe"),
+        (Join-Path $env:SystemRoot "System32\py.exe")
+    ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -Unique
+
+    foreach ($launcher in $pyLaunchers) {
         try {
-            $ver = (& "$pyLauncher" -3.11 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>&1 | Select-Object -First 1)
-            if ($LASTEXITCODE -eq 0 -and "$ver".Trim() -eq "3.11") {
-                return [pscustomobject]@{ Exe = $pyLauncher; Extra = @("-3.11") }
+            $ver = (& "$launcher" -3.11 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>&1 | Select-Object -First 1)
+            if ("$ver".Trim() -eq "3.11") {
+                return [pscustomobject]@{ Exe = $launcher; Extra = @("-3.11") }
             }
         } catch {}
     }
 
-    # Strategy 2: Direct python.exe paths (various winget / user / system install locations)
     $directPaths = @(
-        "$env:LocalAppData\Programs\Python\Python311\python.exe",
-        "$env:ProgramFiles\Python311\python.exe",
-        "$env:ProgramFiles\Python\Python311\python.exe",
-        "$env:ProgramW6432\Python311\python.exe",
+        (Join-Path $env:LocalAppData "Programs\Python\Python311\python.exe"),
+        (Join-Path $env:ProgramFiles "Python311\python.exe"),
+        (Join-Path $env:ProgramFiles "Python\Python311\python.exe"),
+        (Join-Path ${env:ProgramFiles(x86)} "Python311\python.exe"),
         (Get-Cmd "python3.11.exe"),
         (Get-Cmd "python.exe")
-    ) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique
+    ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -Unique
 
-    foreach ($c in $directPaths) {
+    foreach ($candidate in $directPaths) {
         try {
-            $ver = (& "$c" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>&1 | Select-Object -First 1)
-            if ($LASTEXITCODE -eq 0 -and "$ver".Trim() -eq "3.11") {
-                return [pscustomobject]@{ Exe = $c; Extra = @() }
+            $ver = (& "$candidate" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>&1 | Select-Object -First 1)
+            if ("$ver".Trim() -eq "3.11") {
+                return [pscustomobject]@{ Exe = $candidate; Extra = @() }
             }
         } catch {}
     }
@@ -132,47 +204,62 @@ function Find-Python311 {
 
 function Ensure-Python311 {
     $py = Find-Python311
-    if ($py) { Write-Step "Python 3.11 found: $($py.Exe)"; return $py }
+    if ($py) {
+        Write-Step "Python 3.11 found: $($py.Exe)"
+        return $py
+    }
 
-    Write-Step "Installing Python 3.11 via winget …"
-    # -1978335189 = APPINSTALLER_CLI_ERROR_UPDATE_NOT_APPLICABLE (already at latest — OK)
-    Invoke-Ok "winget.exe" @("install","--id","Python.Python.3.11","--exact",
-        "--accept-source-agreements","--accept-package-agreements","--silent") -OkCodes @(0, -1978335189)
-    Refresh-Path
+    if ($NoInstallFlag) {
+        Write-Err "Python 3.11 is missing. Install Python.Python.3.11 or re-run without -NoInstall."
+    }
+
+    Ensure-Winget
+    Write-Step "Installing Python 3.11 via winget"
+    Invoke-Ok "winget.exe" @(
+        "install", "--id", "Python.Python.3.11", "--exact",
+        "--accept-source-agreements", "--accept-package-agreements", "--silent"
+    ) -OkCodes @(0, -1978335189)
     Start-Sleep -Seconds 3
+    Refresh-Path
 
     $py = Find-Python311
-    if (-not $py) { Write-Err "Python 3.11 not found after install. Open a new PowerShell and re-run." }
+    if (-not $py) {
+        Write-Err "Python 3.11 not found after install. Open a new PowerShell window and re-run."
+    }
     Write-Step "Python 3.11 ready: $($py.Exe)"
     return $py
 }
 
-# ── Step 4: Tailscale ─────────────────────────────────────────────────────────
-
 function Find-Tailscale {
     $candidates = @(
         (Get-Cmd "tailscale.exe"),
-        "$env:ProgramFiles\Tailscale\tailscale.exe"
-    ) | Where-Object { $_ -and (Test-Path $_) }
-    if ($candidates) { return $candidates[0] }
+        (Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"),
+        (Join-Path ${env:ProgramFiles(x86)} "Tailscale\tailscale.exe")
+    ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -Unique
+
+    if (@($candidates).Count -gt 0) { return @($candidates)[0] }
     return $null
 }
 
 function Test-TailscaleRunning {
     param([string]$Exe)
     try {
-        $s = (& "$Exe" status --json 2>&1 | Out-String)
-        return $s -match '"BackendState"\s*:\s*"Running"'
-    } catch { return $false }
+        $status = (& "$Exe" status --json 2>&1 | Out-String)
+        return $status -match '"BackendState"\s*:\s*"Running"'
+    } catch {
+        return $false
+    }
 }
 
 function Ensure-Tailscale {
+    if ($SkipTailscaleFlag) {
+        Write-Step "Skipping Tailscale setup"
+        return
+    }
+
     $ts = Find-Tailscale
     if (-not $ts) {
-        Write-Step "Installing Tailscale via winget …"
-        Invoke-Ok "winget.exe" @("install","--id","Tailscale.Tailscale","--exact",
-            "--accept-source-agreements","--accept-package-agreements","--silent") -OkCodes @(0, -1978335189)
-        Refresh-Path
+        Ensure-WingetPkg "tailscale.exe" "Tailscale.Tailscale" "Tailscale"
         $ts = Find-Tailscale
     } else {
         Write-Step "Tailscale already present"
@@ -181,42 +268,58 @@ function Ensure-Tailscale {
 
     $svc = Get-Service -Name "Tailscale" -ErrorAction SilentlyContinue
     if ($svc -and $svc.Status -ne "Running") {
-        Write-Step "Starting Tailscale service …"
-        Start-Service -Name "Tailscale" -ErrorAction SilentlyContinue
+        Write-Step "Starting Tailscale service"
+        try { Start-Service -Name "Tailscale" } catch { Write-Warn "Could not start Tailscale service: $_" }
     }
 
-    if (Test-TailscaleRunning $ts) { Write-Step "Tailscale is authenticated"; return }
+    if (Test-TailscaleRunning $ts) {
+        Write-Step "Tailscale is authenticated"
+        return
+    }
 
-    Write-Step "Authenticate Tailscale — a browser window will open (or copy the URL below):"
+    Write-Step "Authenticating Tailscale"
     $out = (& "$ts" up --timeout=1s 2>&1 | Out-String)
     Write-Host $out
-    $url = [regex]::Match($out, "https://\S+").Value
-    if ($url) { Start-Process $url } else { & "$ts" up }
 
-    Write-Step "Waiting for Tailscale authentication …"
+    $url = [regex]::Match($out, "https://\S+").Value
+    if ($url -and -not (Test-Truthy $env:WORKER_NO_BROWSER)) {
+        Start-Process $url
+    } elseif ($url) {
+        Write-Host "[worker:win] Open this URL to authenticate: $url"
+    } else {
+        & "$ts" up
+    }
+
+    Write-Step "Waiting for Tailscale authentication"
     while (-not (Test-TailscaleRunning $ts)) { Start-Sleep -Seconds 5 }
     Write-Step "Tailscale is authenticated"
 }
 
-# ── Step 5: Clone / update repo ───────────────────────────────────────────────
-
 function Ensure-Repo {
-    if (Test-Path (Join-Path $RepoDir ".git")) {
-        Write-Step "Repo already present at $RepoDir — pulling latest"
-        Invoke-Ok "git.exe" @("-C", $RepoDir, "pull", "--ff-only")
-    } else {
-        Write-Step "Cloning $RepoUrl → $RepoDir"
-        Invoke-Ok "git.exe" @("clone", $RepoUrl, $RepoDir)
+    if (Test-Path -LiteralPath (Join-Path $RepoDir ".git")) {
+        Write-Step "Using repo at $RepoDir"
+        if ($UpdateRepoFlag) {
+            Ensure-WingetPkg "git.exe" "Git.Git" "Git"
+            Write-Step "Pulling latest changes"
+            Invoke-Ok "git.exe" @("-C", $RepoDir, "pull", "--ff-only")
+        }
+        return
     }
-}
 
-# ── Step 6 & 7: Venv + dependencies ──────────────────────────────────────────
+    if ((Test-Path -LiteralPath $RepoDir) -and -not (Test-Path -LiteralPath (Join-Path $RepoDir ".git"))) {
+        Write-Err "REPO_DIR exists but is not a git checkout: $RepoDir"
+    }
+
+    Ensure-WingetPkg "git.exe" "Git.Git" "Git"
+    Write-Step "Cloning $RepoUrl to $RepoDir"
+    Invoke-Ok "git.exe" @("clone", $RepoUrl, $RepoDir)
+}
 
 function Detect-CudaVersion {
     $nvidiaSmi = Get-Cmd "nvidia-smi.exe"
     if (-not $nvidiaSmi) { return $null }
     try {
-        $out   = (& "$nvidiaSmi" 2>&1 | Out-String)
+        $out = (& "$nvidiaSmi" 2>&1 | Out-String)
         $match = [regex]::Match($out, "CUDA Version:\s*([\d\.]+)")
         if ($match.Success) { return $match.Groups[1].Value }
     } catch {}
@@ -226,137 +329,217 @@ function Detect-CudaVersion {
 function Get-TorchIndexUrl {
     $cuda = Detect-CudaVersion
     if (-not $cuda) {
-        Write-Step "No NVIDIA GPU detected — installing CPU-only PyTorch"
+        Write-Step "No NVIDIA GPU detected; installing CPU-only PyTorch"
         return "https://download.pytorch.org/whl/cpu"
     }
-    $major = [int]($cuda -split "\.")[0]
-    $minor = [int]($cuda -split "\.")[1]
+
+    $parts = $cuda -split "\."
+    $major = [int]$parts[0]
+    $minor = if ($parts.Count -gt 1) { [int]$parts[1] } else { 0 }
     Write-Step "CUDA $cuda detected"
-    if     ($major -ge 12 -and $minor -ge 4) { return "https://download.pytorch.org/whl/cu124" }
-    elseif ($major -ge 12 -and $minor -ge 1) { return "https://download.pytorch.org/whl/cu121" }
-    elseif ($major -ge 11 -and $minor -ge 8) { return "https://download.pytorch.org/whl/cu118" }
-    else {
-        Write-Step "CUDA $cuda is older than 11.8 — falling back to CPU-only PyTorch"
-        return "https://download.pytorch.org/whl/cpu"
-    }
+
+    if ($major -gt 12 -or ($major -eq 12 -and $minor -ge 4)) { return "https://download.pytorch.org/whl/cu124" }
+    if ($major -eq 12 -and $minor -ge 1) { return "https://download.pytorch.org/whl/cu121" }
+    if ($major -eq 11 -and $minor -ge 8) { return "https://download.pytorch.org/whl/cu118" }
+
+    Write-Step "CUDA $cuda is older than 11.8; falling back to CPU-only PyTorch"
+    return "https://download.pytorch.org/whl/cpu"
 }
 
 function Ensure-Venv {
     param([object]$PySpec)
 
-    $VenvPython = Join-Path $VenvDir "Scripts\python.exe"
+    $venvDir = Join-Path $RepoDir ".venv"
+    $venvPython = Join-Path $venvDir "Scripts\python.exe"
 
-    if (-not (Test-Path $VenvPython)) {
-        Write-Step "Creating virtual environment at $VenvDir"
-        $venvArgs = $PySpec.Extra + @("-m", "venv", $VenvDir)
+    if (-not (Test-Path -LiteralPath $venvPython)) {
+        Write-Step "Creating virtual environment at $venvDir"
+        $venvArgs = @($PySpec.Extra) + @("-m", "venv", $venvDir)
         & $PySpec.Exe @venvArgs 2>&1 | ForEach-Object { Write-Host $_ }
         if ($LASTEXITCODE -ne 0) { Write-Err "venv creation failed" }
     } else {
         Write-Step "Virtual environment already present"
     }
 
-    # Check if deps are already installed
-    $probe = & "$VenvPython" -c "import torch, torchvision, grpc" 2>&1
-    if ($LASTEXITCODE -eq 0) {
+    $depsReady = Test-PythonImports $venvPython "import torch, torchvision, grpc, grpc_tools, psutil, numpy"
+    if ($depsReady) {
         Write-Step "Dependencies already installed"
-        return $VenvPython
+        return $venvPython
     }
 
-    Write-Step "Upgrading pip …"
-    Invoke-Ok $VenvPython @("-m","pip","install","--upgrade","pip","setuptools","wheel","--quiet")
+    Write-Step "Upgrading pip"
+    Invoke-Ok $venvPython @("-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel", "--quiet")
 
-    # PyTorch — choose CUDA or CPU build based on detected GPU
-    $probe2 = & "$VenvPython" -c "import torch" 2>&1
-    if ($LASTEXITCODE -ne 0) {
+    $torchReady = Test-PythonImports $venvPython "import torch, torchvision"
+    if (-not $torchReady) {
         $indexUrl = Get-TorchIndexUrl
-        Write-Step "Installing PyTorch from $indexUrl …"
-        Invoke-Ok $VenvPython @("-m","pip","install","torch","torchvision",
-            "--index-url",$indexUrl,"--quiet")
+        Write-Step "Installing PyTorch from $indexUrl"
+        Invoke-Ok $venvPython @("-m", "pip", "install", "torch", "torchvision", "--index-url", $indexUrl, "--quiet")
     } else {
         Write-Step "PyTorch already installed"
     }
 
-    Write-Step "Installing project requirements …"
-    Invoke-Ok $VenvPython @("-m","pip","install","-r",(Join-Path $RepoDir "requirements.txt"),"--quiet")
+    Write-Step "Installing project requirements"
+    Invoke-Ok $venvPython @("-m", "pip", "install", "-r", (Join-Path $RepoDir "requirements.txt"), "--quiet")
 
-    return $VenvPython
+    return $venvPython
 }
-
-# ── Step 8: Proto stubs ───────────────────────────────────────────────────────
 
 function Ensure-Proto {
     param([string]$VenvPython)
 
-    $pb2     = Join-Path $RepoDir "proto\trainer_pb2.py"
-    $pb2grpc = Join-Path $RepoDir "proto\trainer_pb2_grpc.py"
+    $protoDir = Join-Path $RepoDir "proto"
+    $pb2 = Join-Path $protoDir "trainer_pb2.py"
+    $pb2grpc = Join-Path $protoDir "trainer_pb2_grpc.py"
 
-    if ((Test-Path $pb2) -and (Test-Path $pb2grpc)) {
+    if ((Test-Path -LiteralPath $pb2) -and (Test-Path -LiteralPath $pb2grpc)) {
         Write-Step "Proto stubs already generated"
         return
     }
 
-    Write-Step "Generating gRPC proto stubs …"
-    $protoDir = Join-Path $RepoDir "proto"
-    Invoke-Ok $VenvPython @("-m","grpc_tools.protoc",
+    Write-Step "Generating gRPC proto stubs"
+    Invoke-Ok $VenvPython @(
+        "-m", "grpc_tools.protoc",
         "--proto_path=$protoDir",
         "--python_out=$protoDir",
         "--grpc_python_out=$protoDir",
-        (Join-Path $protoDir "trainer.proto"))
+        (Join-Path $protoDir "trainer.proto")
+    )
 
-    # Fix absolute import → relative
-    $grpcFile = Join-Path $protoDir "trainer_pb2_grpc.py"
-    $content  = Get-Content $grpcFile -Raw
-    $fixed    = $content -replace "^import trainer_pb2", "from . import trainer_pb2"
-    Set-Content $grpcFile $fixed
+    $content = Get-Content $pb2grpc -Raw
+    $fixed = $content -replace "(?m)^import trainer_pb2", "from . import trainer_pb2"
+    Set-Content -LiteralPath $pb2grpc -Value $fixed -Encoding UTF8
 
-    # Ensure __init__.py
     $init = Join-Path $protoDir "__init__.py"
-    if (-not (Test-Path $init)) { New-Item -ItemType File $init | Out-Null }
-
+    if (-not (Test-Path -LiteralPath $init)) { New-Item -ItemType File -Path $init | Out-Null }
     Write-Step "Proto stubs generated"
 }
 
-# ── Step 9: Dataset ───────────────────────────────────────────────────────────
-
 function Ensure-Dataset {
     param([string]$VenvPython)
-    if ($SkipDataset -eq "1") {
-        Write-Step "Skipping dataset download (SKIP_DATASET=1)"
+
+    if ($SkipDatasetFlag) {
+        Write-Step "Skipping dataset download"
         return
     }
-    Write-Step "Checking dataset …"
-    & "$VenvPython" (Join-Path $RepoDir "dataset.py")
-    if ($LASTEXITCODE -ne 0) { Write-Step "Dataset download will be retried by the worker on first run." }
+
+    Write-Step "Checking $Dataset dataset"
+    $args = @((Join-Path $RepoDir "dataset.py"), "--dataset", $Dataset)
+    if ($CacheDir) { $args += @("--root", $CacheDir) }
+    & "$VenvPython" @args
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warn "Dataset setup failed; worker.py will retry on first run."
+    }
 }
 
-# ── Step 10: Launch ───────────────────────────────────────────────────────────
+function Show-Hardware {
+    param([string]$VenvPython)
+    Write-Step "Hardware detected"
+    try {
+        & "$VenvPython" (Join-Path $RepoDir "hardware_probe.py") 2>$null |
+            Select-String '"score"|"type"|"name"|"cpu_cores"|"ram_gb"'
+    } catch {
+        Write-Warn "Hardware probe failed: $_"
+    }
+}
+
+function Test-LeaderPort {
+    if (-not (Get-Command Test-NetConnection -ErrorAction SilentlyContinue)) { return }
+    Write-Step "Checking leader TCP reachability: ${LeaderHost}:${LeaderPort}"
+    try {
+        $ok = Test-NetConnection -ComputerName $LeaderHost -Port $LeaderPort -InformationLevel Quiet -WarningAction SilentlyContinue
+        if ($ok) {
+            Write-Step "Leader port is reachable"
+        } else {
+            Write-Warn "Leader port is not reachable yet. worker.py will keep retrying."
+        }
+    } catch {
+        Write-Warn "Leader reachability check failed: $_"
+    }
+}
 
 function Start-Worker {
     param([string]$VenvPython)
-    Write-Step "Hardware detected:"
-    & "$VenvPython" (Join-Path $RepoDir "hardware_probe.py") 2>$null | Select-String '"score"|"type"|"name"'
 
-    Write-Step "Starting worker → leader=${LeaderHost}:${LeaderPort}"
-    & "$VenvPython" (Join-Path $RepoDir "worker.py") --leader $LeaderHost --port $LeaderPort
+    Show-Hardware $VenvPython
+    Test-LeaderPort
+
+    $launchArgs = @(
+        (Join-Path $RepoDir "worker.py"),
+        "--leader", $LeaderHost,
+        "--port", "$LeaderPort",
+        "--dataset", $Dataset,
+        "--connect-retries", "$ConnectRetries"
+    )
+    if ($CacheDir) { $launchArgs += @("--cache-dir", $CacheDir) }
+    if ($DryRunFlag) { $launchArgs += "--dry-run" }
+    if ($WorkerArgs) { $launchArgs += $WorkerArgs }
+
+    Write-Step "Starting worker -> leader=${LeaderHost}:${LeaderPort}"
+    & "$VenvPython" @launchArgs
+    exit $LASTEXITCODE
 }
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+$scriptPath = if ($PSCommandPath) { $PSCommandPath } else { $MyInvocation.MyCommand.Path }
+$scriptRoot = Split-Path -Parent $scriptPath
+$repoBesideScript = Resolve-Path -LiteralPath (Join-Path $scriptRoot "..") -ErrorAction SilentlyContinue
+
+$LeaderHost = First-Value @($LeaderHost, $env:LEADER_HOST, "leader-macbook-pro.taila5426e.ts.net")
+$LeaderPort = if ($LeaderPort -gt 0) { $LeaderPort } elseif ($env:LEADER_PORT) { [int]$env:LEADER_PORT } else { 50051 }
+$ConnectRetries = if ($ConnectRetries -gt 0) { $ConnectRetries } elseif ($env:CONNECT_RETRIES) { [int]$env:CONNECT_RETRIES } else { 2147483647 }
+$RepoUrl = First-Value @($RepoUrl, $env:REPO_URL, "https://github.com/Ruturaj-Vasant/Distributed_Hetrogeneous_Training.git")
+$Dataset = First-Value @($Dataset, $env:DATASET, "tinyimagenet")
+$CacheDir = First-Value @($CacheDir, $env:CACHE_DIR)
+
+if (-not $RepoDir) {
+    if ($env:REPO_DIR) {
+        $RepoDir = $env:REPO_DIR
+    } elseif ($repoBesideScript -and (Test-Path -LiteralPath (Join-Path $repoBesideScript ".git"))) {
+        $RepoDir = $repoBesideScript.Path
+    } else {
+        $RepoDir = Join-Path $HOME "distributed-resnet"
+    }
+}
+
+$RepoDir = [System.IO.Path]::GetFullPath($RepoDir)
+
+$SkipDatasetFlag = [bool]$SkipDataset -or (Test-Truthy $env:SKIP_DATASET)
+$SkipTailscaleFlag = [bool]$SkipTailscale -or (Test-Truthy $env:SKIP_TAILSCALE)
+$DryRunFlag = [bool]$DryRun -or (Test-Truthy $env:DRY_RUN)
+$SetupOnlyFlag = [bool]$SetupOnly -or (Test-Truthy $env:WORKER_SETUP_ONLY)
+$NoInstallFlag = [bool]$NoInstall -or (Test-Truthy $env:WORKER_NO_INSTALL)
+$UpdateRepoFlag = [bool]$UpdateRepo -or (Test-Truthy $env:UPDATE_REPO)
+
+if ($WorkerArgs -and $WorkerArgs.Count -gt 0 -and $WorkerArgs[0].ToLowerInvariant() -eq "run") {
+    $WorkerArgs = if ($WorkerArgs.Count -gt 1) { $WorkerArgs[1..($WorkerArgs.Count - 1)] } else { @() }
+}
+
+if ($Dataset -notin @("tinyimagenet", "cifar10")) {
+    Write-Err "Unsupported dataset '$Dataset'. Expected tinyimagenet or cifar10."
+}
 
 function Main {
     Write-Step "=== Distributed ResNet Worker Bootstrap (Windows) ==="
+    Write-Step "Repo: $RepoDir"
+    Write-Step "Leader: ${LeaderHost}:${LeaderPort}"
 
-    Ensure-Winget
-    Ensure-WingetPkg "git.exe"  "Git.Git"
-
-    $py         = Ensure-Python311
-    Ensure-Tailscale
     Ensure-Repo
-
     Set-Location $RepoDir
+
+    $py = Ensure-Python311
+    Ensure-Tailscale
 
     $venvPython = Ensure-Venv $py
     Ensure-Proto $venvPython
     Ensure-Dataset $venvPython
+
+    if ($SetupOnlyFlag) {
+        Show-Hardware $venvPython
+        Test-LeaderPort
+        Write-Step "Setup complete; not starting worker because SetupOnly is enabled"
+        return
+    }
+
     Start-Worker $venvPython
 }
 

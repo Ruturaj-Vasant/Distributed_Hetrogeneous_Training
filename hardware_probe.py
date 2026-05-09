@@ -74,9 +74,10 @@ def _detect_hardware() -> HardwareInfo:
         for i in range(torch.cuda.device_count()):
             props = torch.cuda.get_device_properties(i)
             vram  = props.total_memory / (1024 ** 3)
-            # rough FP32 TFLOPS from SM count × clock — vendor doesn't expose
-            # this directly, so we approximate conservatively
-            tflops = (props.multi_processor_count * props.max_clock_rate * 1e-6 * 2) / 1e3
+            # Rough FP32 TFLOPS from SM count and clock when PyTorch exposes
+            # clock data. Some Windows/CUDA builds omit max_clock_rate.
+            max_clock_rate = getattr(props, "max_clock_rate", 0) or 0
+            tflops = (props.multi_processor_count * max_clock_rate * 1e-6 * 2) / 1e3
             accelerators.append(AcceleratorInfo(
                 type      = AccelType.CUDA,
                 name      = props.name,
