@@ -100,9 +100,17 @@ function Invoke-Ok {
     $resolved = if (Test-Path -LiteralPath $Exe) { $Exe } else { Get-Cmd $Exe }
     if (-not $resolved) { throw "Not found: $Exe" }
 
-    & "$resolved" @Arguments 2>&1 | ForEach-Object { Write-Host $_ }
-    if ($LASTEXITCODE -notin $OkCodes) {
-        throw "Exit $LASTEXITCODE : $resolved $($Arguments -join ' ')"
+    $oldPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        & "$resolved" @Arguments 2>&1 | ForEach-Object { Write-Host $_ }
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $oldPreference
+    }
+
+    if ($exitCode -notin $OkCodes) {
+        throw "Exit $exitCode : $resolved $($Arguments -join ' ')"
     }
 }
 
