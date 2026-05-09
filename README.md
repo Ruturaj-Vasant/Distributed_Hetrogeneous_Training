@@ -2,6 +2,8 @@
 
 Train ResNet-101 across multiple laptops (Mac MPS + Windows CUDA) connected over **Tailscale**, with dynamic worker registration, hardware-proportional data sharding, and Top-K gradient compression.
 
+**Project page:** https://ruturaj-vasant.github.io/Distributed_Hetrogeneous_Training/
+
 ---
 
 ## Architecture
