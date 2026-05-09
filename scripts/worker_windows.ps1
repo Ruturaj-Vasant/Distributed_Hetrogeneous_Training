@@ -63,11 +63,11 @@ function Get-Cmd {
 }
 
 function Invoke-Ok {
-    param([string]$Exe, [string[]]$Arguments)
+    param([string]$Exe, [string[]]$Arguments, [int[]]$OkCodes = @(0))
     $resolved = if (Test-Path $Exe) { $Exe } else { Get-Cmd $Exe }
     if (-not $resolved) { throw "Not found: $Exe" }
     & "$resolved" @Arguments 2>&1 | ForEach-Object { Write-Host $_ }
-    if ($LASTEXITCODE -ne 0) { throw "Exit $LASTEXITCODE : $resolved $($Arguments -join ' ')" }
+    if ($LASTEXITCODE -notin $OkCodes) { throw "Exit $LASTEXITCODE : $resolved $($Arguments -join ' ')" }
 }
 
 # ── Step 1: winget ────────────────────────────────────────────────────────────
@@ -86,7 +86,8 @@ function Ensure-WingetPkg {
     param([string]$Cmd, [string]$PkgId)
     if (Get-Cmd $Cmd) { Write-Step "$Cmd already present"; return }
     Write-Step "Installing $PkgId via winget …"
-    Invoke-Ok "winget.exe" @("install","--id",$PkgId,"--exact","--accept-source-agreements","--accept-package-agreements","--silent")
+    # -1978335189 = APPINSTALLER_CLI_ERROR_UPDATE_NOT_APPLICABLE (already at latest version — OK)
+    Invoke-Ok "winget.exe" @("install","--id",$PkgId,"--exact","--accept-source-agreements","--accept-package-agreements","--silent") -OkCodes @(0, -1978335189)
     Refresh-Path
 }
 
@@ -100,7 +101,11 @@ function Find-Python311 {
         (Get-Cmd "py.exe"),
         "$env:SystemRoot\py.exe",
         "$env:LocalAppData\Programs\Python\Python311\python.exe",
-        "$env:ProgramFiles\Python311\python.exe"
+        "$env:ProgramFiles\Python311\python.exe",
+        "$env:ProgramFiles\Python\Python311\python.exe",
+        "$env:ProgramW6432\Python311\python.exe",
+        (Get-Cmd "python3.11.exe"),
+        (Get-Cmd "python.exe")
     ) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique
 
     foreach ($c in $candidates) {
@@ -121,8 +126,9 @@ function Ensure-Python311 {
     if ($py) { Write-Step "Python 3.11 found: $($py.Exe)"; return $py }
 
     Write-Step "Installing Python 3.11 via winget …"
+    # -1978335189 = APPINSTALLER_CLI_ERROR_UPDATE_NOT_APPLICABLE (already at latest — OK)
     Invoke-Ok "winget.exe" @("install","--id","Python.Python.3.11","--exact",
-        "--accept-source-agreements","--accept-package-agreements","--silent")
+        "--accept-source-agreements","--accept-package-agreements","--silent") -OkCodes @(0, -1978335189)
     Refresh-Path
     Start-Sleep -Seconds 3
 
@@ -156,7 +162,7 @@ function Ensure-Tailscale {
     if (-not $ts) {
         Write-Step "Installing Tailscale via winget …"
         Invoke-Ok "winget.exe" @("install","--id","Tailscale.Tailscale","--exact",
-            "--accept-source-agreements","--accept-package-agreements","--silent")
+            "--accept-source-agreements","--accept-package-agreements","--silent") -OkCodes @(0, -1978335189)
         Refresh-Path
         $ts = Find-Tailscale
     } else {
