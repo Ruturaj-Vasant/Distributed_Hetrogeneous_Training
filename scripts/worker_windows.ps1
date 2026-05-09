@@ -97,9 +97,20 @@ function Ensure-WingetPkg {
 # ── Step 3: Python 3.11 ───────────────────────────────────────────────────────
 
 function Find-Python311 {
-    $candidates = @(
-        (Get-Cmd "py.exe"),
-        "$env:SystemRoot\py.exe",
+    # Strategy 1: Python Launcher (py -3.11) — the standard Windows mechanism
+    $pyLauncher = @((Get-Cmd "py.exe"), "$env:SystemRoot\py.exe", "$env:SystemRoot\System32\py.exe") |
+        Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+    if ($pyLauncher) {
+        try {
+            $ver = (& "$pyLauncher" -3.11 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>&1 | Select-Object -First 1)
+            if ($LASTEXITCODE -eq 0 -and "$ver".Trim() -eq "3.11") {
+                return [pscustomobject]@{ Exe = $pyLauncher; Extra = @("-3.11") }
+            }
+        } catch {}
+    }
+
+    # Strategy 2: Direct python.exe paths (various winget / user / system install locations)
+    $directPaths = @(
         "$env:LocalAppData\Programs\Python\Python311\python.exe",
         "$env:ProgramFiles\Python311\python.exe",
         "$env:ProgramFiles\Python\Python311\python.exe",
@@ -108,13 +119,11 @@ function Find-Python311 {
         (Get-Cmd "python.exe")
     ) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique
 
-    foreach ($c in $candidates) {
-        $launcherArgs = if ($c -match "py\.exe$") { @("-3.11") } else { @() }
-        $probeArgs = $launcherArgs + @("-c", "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+    foreach ($c in $directPaths) {
         try {
-            $ver = (& "$c" @probeArgs 2>&1 | Select-Object -First 1)
-            if ($LASTEXITCODE -eq 0 -and $ver -eq "3.11") {
-                return [pscustomobject]@{ Exe = $c; Extra = $launcherArgs }
+            $ver = (& "$c" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>&1 | Select-Object -First 1)
+            if ($LASTEXITCODE -eq 0 -and "$ver".Trim() -eq "3.11") {
+                return [pscustomobject]@{ Exe = $c; Extra = @() }
             }
         } catch {}
     }
