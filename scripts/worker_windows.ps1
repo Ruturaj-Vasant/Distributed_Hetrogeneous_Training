@@ -354,6 +354,26 @@ function Get-TorchIndexUrl {
     return "https://download.pytorch.org/whl/cpu"
 }
 
+function Repair-PipArtifacts {
+    param([string]$VenvPython)
+
+    $venvRoot = Split-Path -Parent (Split-Path -Parent $VenvPython)
+    $sitePackages = Join-Path $venvRoot "Lib\site-packages"
+    if (-not (Test-Path -LiteralPath $sitePackages)) { return }
+
+    $artifacts = @(Get-ChildItem -LiteralPath $sitePackages -Force -Filter "~ip*" -ErrorAction SilentlyContinue)
+    if ($artifacts.Count -eq 0) { return }
+
+    Write-Step "Cleaning incomplete pip upgrade artifacts"
+    foreach ($artifact in $artifacts) {
+        try {
+            Remove-Item -LiteralPath $artifact.FullName -Recurse -Force -ErrorAction Stop
+        } catch {
+            Write-Warn "Could not remove $($artifact.FullName): $_"
+        }
+    }
+}
+
 function Ensure-Venv {
     param([object]$PySpec)
 
@@ -368,6 +388,8 @@ function Ensure-Venv {
     } else {
         Write-Step "Virtual environment already present"
     }
+
+    Repair-PipArtifacts $venvPython
 
     $depsReady = Test-PythonImports $venvPython "import torch, torchvision, grpc, grpc_tools, psutil, numpy"
     if ($depsReady) {
