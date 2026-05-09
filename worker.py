@@ -592,6 +592,31 @@ def _resolve_device(suggested: str) -> torch.device:
     return torch.device("cpu")
 
 
+def _parse_dataset_list(value: str | None, primary: str) -> list[str]:
+    valid = {"tinyimagenet", "cifar10"}
+    names: list[str] = []
+
+    for raw in (value or primary).split(","):
+        name = raw.strip().lower()
+        if not name:
+            continue
+        if name == "all":
+            for candidate in ("tinyimagenet", "cifar10"):
+                if candidate not in names:
+                    names.append(candidate)
+            continue
+        if name not in valid:
+            raise ValueError(
+                f"Unsupported dataset {name!r}; expected tinyimagenet, cifar10, or all"
+            )
+        if name not in names:
+            names.append(name)
+
+    if primary not in names:
+        names.insert(0, primary)
+    return names
+
+
 # ── Main entry point ──────────────────────────────────────────────────────────
 
 async def run(cfg: argparse.Namespace) -> None:
@@ -607,6 +632,7 @@ async def run(cfg: argparse.Namespace) -> None:
     )
 
     # ── Step 2: dataset download ─────────────────────────────────────────────
+    preload_datasets = _parse_dataset_list(cfg.preload_datasets, cfg.dataset)
     if cfg.dry_run:
         log.info("Dry-run mode: skipping dataset download (synthetic data will be used)")
     else:
@@ -614,6 +640,13 @@ async def run(cfg: argparse.Namespace) -> None:
         await asyncio.get_event_loop().run_in_executor(
             None, lambda: ensure_any_dataset(cfg.dataset, cfg.cache_dir)
         )
+        for dataset_name in preload_datasets:
+            if dataset_name == cfg.dataset:
+                continue
+            log.info(f"Ensuring {dataset_name} dataset is present â€¦")
+            await asyncio.get_event_loop().run_in_executor(
+                None, lambda name=dataset_name: ensure_any_dataset(name, cfg.cache_dir)
+            )
 
     _MODEL_FNS = {
         "resnet18":  models.resnet18,
@@ -697,7 +730,7 @@ async def run(cfg: argparse.Namespace) -> None:
                         f"batch={assignment.local_batch_size}"
                     )
                 else:
-                    if dataset_name != cfg.dataset:
+                    if dataset_name not in preload_datasets:
                         log.info(
                             f"Leader requested {dataset_name!r} but worker pre-downloaded "
                             f"{cfg.dataset!r} — downloading {dataset_name} now …"
@@ -810,6 +843,11 @@ if __name__ == "__main__":
     p.add_argument(
         "--dataset", default="tinyimagenet", choices=["tinyimagenet", "cifar10"],
         help="Dataset to pre-download before connecting to the leader (default: tinyimagenet)"
+    )
+    p.add_argument(
+        "--preload-datasets", default=None, dest="preload_datasets",
+        help="Comma-separated datasets to pre-download before connecting "
+             "(tinyimagenet,cifar10,all). Defaults to --dataset."
     )
     p.add_argument(
         "--cache-dir", default=None, dest="cache_dir",

@@ -13,7 +13,7 @@
 #   -NoInstall             Fail with instructions instead of installing missing tools.
 #
 # Environment variable equivalents are also supported:
-#   LEADER_HOST, LEADER_PORT, REPO_URL, REPO_DIR, DATASET, CACHE_DIR,
+#   LEADER_HOST, LEADER_PORT, REPO_URL, REPO_DIR, DATASET, PRELOAD_DATASETS, CACHE_DIR,
 #   CONNECT_RETRIES,
 #   SKIP_DATASET=1, SKIP_TAILSCALE=1, DRY_RUN=1, WORKER_SETUP_ONLY=1,
 #   WORKER_NO_INSTALL=1, UPDATE_REPO=1, WORKER_NO_BROWSER=1
@@ -25,6 +25,7 @@ param(
     [string]$RepoUrl,
     [string]$RepoDir,
     [string]$Dataset,
+    [string]$PreloadDatasets,
     [string]$CacheDir,
     [int]$ConnectRetries = 0,
     [switch]$SkipDataset,
@@ -51,6 +52,35 @@ function First-Value {
         if ($null -ne $value -and "$value".Trim() -ne "") { return "$value" }
     }
     return $null
+}
+
+function Get-DatasetList {
+    param(
+        [string]$Raw,
+        [string]$PrimaryDataset
+    )
+
+    $valid = @("tinyimagenet", "cifar10")
+    $result = New-Object System.Collections.Generic.List[string]
+    foreach ($item in ($Raw -split ",")) {
+        $name = $item.Trim().ToLowerInvariant()
+        if (-not $name) { continue }
+        if ($name -eq "all") {
+            foreach ($datasetName in $valid) {
+                if (-not $result.Contains($datasetName)) { [void]$result.Add($datasetName) }
+            }
+            continue
+        }
+        if ($name -notin $valid) {
+            Write-Err "Unsupported dataset '$name'. Expected tinyimagenet, cifar10, or all."
+        }
+        if (-not $result.Contains($name)) { [void]$result.Add($name) }
+    }
+
+    if (-not $result.Contains($PrimaryDataset)) {
+        $result.Insert(0, $PrimaryDataset)
+    }
+    return @($result.ToArray())
 }
 
 function Write-Step {
@@ -453,12 +483,14 @@ function Ensure-Dataset {
         return
     }
 
-    Write-Step "Checking $Dataset dataset"
-    $args = @((Join-Path $RepoDir "dataset.py"), "--dataset", $Dataset)
-    if ($CacheDir) { $args += @("--root", $CacheDir) }
-    & "$VenvPython" @args
-    if ($LASTEXITCODE -ne 0) {
-        Write-Warn "Dataset setup failed; worker.py will retry on first run."
+    foreach ($datasetName in $DatasetList) {
+        Write-Step "Checking $datasetName dataset"
+        $args = @((Join-Path $RepoDir "dataset.py"), "--dataset", $datasetName)
+        if ($CacheDir) { $args += @("--root", $CacheDir) }
+        & "$VenvPython" @args
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warn "$datasetName setup failed; worker.py will retry if the leader requests it."
+        }
     }
 }
 
@@ -499,6 +531,7 @@ function Start-Worker {
         "--leader", $LeaderHost,
         "--port", "$LeaderPort",
         "--dataset", $Dataset,
+        "--preload-datasets", ($DatasetList -join ","),
         "--connect-retries", "$ConnectRetries"
     )
     if ($CacheDir) { $launchArgs += @("--cache-dir", $CacheDir) }
@@ -519,6 +552,7 @@ $LeaderPort = if ($LeaderPort -gt 0) { $LeaderPort } elseif ($env:LEADER_PORT) {
 $ConnectRetries = if ($ConnectRetries -gt 0) { $ConnectRetries } elseif ($env:CONNECT_RETRIES) { [int]$env:CONNECT_RETRIES } else { 2147483647 }
 $RepoUrl = First-Value @($RepoUrl, $env:REPO_URL, "https://github.com/Ruturaj-Vasant/Distributed_Hetrogeneous_Training.git")
 $Dataset = First-Value @($Dataset, $env:DATASET, "tinyimagenet")
+$PreloadDatasets = First-Value @($PreloadDatasets, $env:PRELOAD_DATASETS, "tinyimagenet,cifar10")
 $CacheDir = First-Value @($CacheDir, $env:CACHE_DIR)
 
 if (-not $RepoDir) {
@@ -547,6 +581,7 @@ if ($WorkerArgs -and $WorkerArgs.Count -gt 0 -and $WorkerArgs[0].ToLowerInvarian
 if ($Dataset -notin @("tinyimagenet", "cifar10")) {
     Write-Err "Unsupported dataset '$Dataset'. Expected tinyimagenet or cifar10."
 }
+$DatasetList = Get-DatasetList $PreloadDatasets $Dataset
 
 function Main {
     Write-Step "=== Distributed ResNet Worker Bootstrap (Windows) ==="
