@@ -63,11 +63,11 @@ function Get-Cmd {
 }
 
 function Invoke-Ok {
-    param([string]$Exe, [string[]]$Args)
+    param([string]$Exe, [string[]]$Arguments)
     $resolved = if (Test-Path $Exe) { $Exe } else { Get-Cmd $Exe }
     if (-not $resolved) { throw "Not found: $Exe" }
-    & "$resolved" @Args 2>&1 | ForEach-Object { Write-Host $_ }
-    if ($LASTEXITCODE -ne 0) { throw "Exit $LASTEXITCODE : $resolved $($Args -join ' ')" }
+    & "$resolved" @Arguments 2>&1 | ForEach-Object { Write-Host $_ }
+    if ($LASTEXITCODE -ne 0) { throw "Exit $LASTEXITCODE : $resolved $($Arguments -join ' ')" }
 }
 
 # ── Step 1: winget ────────────────────────────────────────────────────────────
@@ -105,9 +105,9 @@ function Find-Python311 {
 
     foreach ($c in $candidates) {
         $launcherArgs = if ($c -match "py\.exe$") { @("-3.11") } else { @() }
-        $args = $launcherArgs + @("-c", "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+        $probeArgs = $launcherArgs + @("-c", "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
         try {
-            $ver = (& "$c" @args 2>&1 | Select-Object -First 1)
+            $ver = (& "$c" @probeArgs 2>&1 | Select-Object -First 1)
             if ($LASTEXITCODE -eq 0 -and $ver -eq "3.11") {
                 return [pscustomobject]@{ Exe = $c; Extra = $launcherArgs }
             }
@@ -233,8 +233,8 @@ function Ensure-Venv {
 
     if (-not (Test-Path $VenvPython)) {
         Write-Step "Creating virtual environment at $VenvDir"
-        $args = $PySpec.Extra + @("-m", "venv", $VenvDir)
-        & $PySpec.Exe @args 2>&1 | ForEach-Object { Write-Host $_ }
+        $venvArgs = $PySpec.Extra + @("-m", "venv", $VenvDir)
+        & $PySpec.Exe @venvArgs 2>&1 | ForEach-Object { Write-Host $_ }
         if ($LASTEXITCODE -ne 0) { Write-Err "venv creation failed" }
     } else {
         Write-Step "Virtual environment already present"
