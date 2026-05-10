@@ -601,13 +601,14 @@
         <pre><span class="comment"># Navigate to the project and pull latest</span>
 <span class="cmd">cd</span> <span class="val">/Users/ruturaj_vasant/Desktop/Academic/AI_New/distributed-resnet</span>
 <span class="cmd">git pull</span>
-<span class="cmd">python3</span> leader.py <span class="flag">--model</span> <span class="val">resnet18</span> <span class="flag">--epochs</span> <span class="val">1</span> <span class="flag">--lr</span> <span class="val">0.01</span> <span class="flag">--batch-size</span> <span class="val">32</span></pre>
+<span class="cmd">pip install</span> <span class="val">-e ".[dev]"</span>
+<span class="cmd">dtrain-leader</span> <span class="flag">--model</span> <span class="val">resnet18</span> <span class="flag">--epochs</span> <span class="val">1</span> <span class="flag">--lr</span> <span class="val">0.01</span> <span class="flag">--batch-size</span> <span class="val">32</span></pre>
         <button class="copy-btn" onclick="copyCode(this)">Copy</button>
       </div>
     </div>
 
     <div class="note">
-      Wait for <code>Commands: start | status | reset | quit</code> — do <strong>not</strong> type <code>start</code> yet. Add workers first.
+      Wait for <code>Commands: start | status | reset | quit</code> — do <strong>not</strong> type <code>start</code> yet. Add workers first. The dashboard opens at <code>http://localhost:8080</code>.
     </div>
   </section>
 
@@ -628,7 +629,7 @@
       </div>
       <div class="code-wrap">
         <pre><span class="cmd">cd</span> <span class="val">/Users/ruturaj_vasant/Desktop/Academic/AI_New/distributed-resnet</span>
-<span class="cmd">python3</span> worker.py</pre>
+<span class="cmd">dtrain-worker</span> <span class="flag">--leader</span> <span class="val">leader-macbook-pro.taila5426e.ts.net</span></pre>
         <button class="copy-btn" onclick="copyCode(this)">Copy</button>
       </div>
     </div>
@@ -640,10 +641,11 @@
         <span class="platform">macOS</span>
       </div>
       <div class="code-wrap">
-        <pre><span class="comment"># Clone repo, bootstrap runs automatically (venv + deps + dataset)</span>
+        <pre><span class="comment"># Clone repo and install the dtrain commands</span>
 <span class="cmd">git clone</span> <span class="val">https://github.com/Ruturaj-Vasant/Distributed_Hetrogeneous_Training.git</span> ~/distributed-resnet
 <span class="cmd">cd</span> ~/distributed-resnet
-<span class="cmd">python3</span> worker.py</pre>
+<span class="cmd">pip install</span> <span class="val">-e ".[dev]"</span>
+<span class="cmd">dtrain-worker</span> <span class="flag">--leader</span> <span class="val">leader-macbook-pro.taila5426e.ts.net</span></pre>
         <button class="copy-btn" onclick="copyCode(this)">Copy</button>
       </div>
     </div>
@@ -657,7 +659,8 @@
       <div class="code-wrap">
         <pre><span class="cmd">git clone</span> <span class="val">https://github.com/Ruturaj-Vasant/Distributed_Hetrogeneous_Training.git</span> <span class="val">$HOME\distributed-resnet</span>
 <span class="cmd">cd</span> <span class="val">$HOME\distributed-resnet</span>
-<span class="cmd">python</span> worker.py</pre>
+<span class="cmd">pip install</span> <span class="val">-e ".[dev]"</span>
+<span class="cmd">dtrain-worker</span> <span class="flag">--leader</span> <span class="val">leader-macbook-pro.taila5426e.ts.net</span></pre>
         <button class="copy-btn" onclick="copyCode(this)">Copy</button>
       </div>
     </div>
@@ -710,14 +713,19 @@
       </div>
       <div class="code-wrap">
         <pre><span class="comment"># From the project directory</span>
-<span class="cmd">python3</span> watch_cluster.py
+<span class="cmd">dtrain-watch</span> <span class="flag">--leader</span> <span class="val">leader-macbook-pro.taila5426e.ts.net</span>
 
-<span class="comment"># Or from a fresh clone (only needs grpcio)</span>
+<span class="comment"># Or from a fresh clone</span>
 <span class="cmd">git clone</span> <span class="val">https://github.com/Ruturaj-Vasant/Distributed_Hetrogeneous_Training.git</span> ~/distributed-resnet
-<span class="cmd">pip install</span> grpcio
-<span class="cmd">python3</span> ~/distributed-resnet/watch_cluster.py</pre>
+<span class="cmd">cd</span> ~/distributed-resnet
+<span class="cmd">pip install</span> <span class="val">-e ".[dev]"</span>
+<span class="cmd">dtrain-watch</span> <span class="flag">--leader</span> <span class="val">leader-macbook-pro.taila5426e.ts.net</span></pre>
         <button class="copy-btn" onclick="copyCode(this)">Copy</button>
       </div>
+    </div>
+
+    <div class="note">
+      The browser dashboard is available from the leader machine at <code>http://localhost:8080</code>. Use it for live loss, worker health, pending-worker admission, start, and reset controls.
     </div>
   </section>
 
@@ -733,7 +741,7 @@
     <div class="card">
       <div class="card-title"><strong>List all saved runs</strong></div>
       <div class="code-wrap">
-        <pre><span class="cmd">python3</span> run_experiments.py <span class="flag">--list</span></pre>
+        <pre><span class="cmd">dtrain-compare</span> <span class="flag">--list</span></pre>
         <button class="copy-btn" onclick="copyCode(this)">Copy</button>
       </div>
     </div>
@@ -741,7 +749,7 @@
     <div class="card">
       <div class="card-title"><strong>Generate comparison plot across experiments</strong></div>
       <div class="code-wrap">
-        <pre><span class="cmd">python3</span> run_experiments.py \
+        <pre><span class="cmd">dtrain-compare</span> \
   <span class="flag">--runs</span>   <span class="val">runs/exp1_dir runs/exp2_dir runs/exp3_dir</span> \
   <span class="flag">--labels</span> <span class="val">"EXP1 Solo" "EXP2 PS Full" "EXP3 PS TopK"</span> \
   <span class="flag">--output</span> <span class="val">comparison.png</span></pre>
@@ -819,6 +827,16 @@
               <td><code>--data-root</code></td>
               <td><span class="default-val">~/.cache/tiny-imagenet-200</span></td>
               <td>Override dataset cache path</td>
+            </tr>
+            <tr>
+              <td><code>--dashboard-port</code></td>
+              <td><span class="default-val">8080</span></td>
+              <td>Web dashboard port. Default URL: <code>http://localhost:8080</code></td>
+            </tr>
+            <tr>
+              <td><code>--no-dashboard</code></td>
+              <td><span class="default-val">off</span></td>
+              <td>Disable the dashboard for headless or CI runs</td>
             </tr>
           </tbody>
         </table>

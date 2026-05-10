@@ -1,14 +1,4 @@
-"""
-run_recorder.py  —  Per-run metrics logger
-
-Creates:
-    runs/<model>__<dataset>__<optimizer>__topk<K>__<timestamp>/
-        config.json    hyperparameters + static run metadata
-        metrics.csv    step rows (loss, round_ms, straggler_delay_s)
-                       and epoch rows (val_acc)  — interleaved
-        summary.json   all config fields + derived result scalars
-        loss.png       loss curve  (requires matplotlib)
-"""
+"""trainer/utils/recorder — Per-run metrics logger."""
 
 from __future__ import annotations
 import csv
@@ -43,7 +33,6 @@ class RunRecorder:
         self.run_dir = Path(runs_root) / run_name
         self.run_dir.mkdir(parents=True, exist_ok=True)
 
-        # Store for use at close()
         self._batch_size    = batch_size
         self._world_size    = world_size
         self._dataset_samples          = dataset_samples
@@ -53,57 +42,44 @@ class RunRecorder:
         self._start_time    = time.monotonic()
 
         self._config = {
-            # Identity
             "model":        model_name,
             "dataset":      dataset,
             "optimizer":    optimizer,
             "topk_k":       topk_k,
-            # Hyperparameters
             "epochs":       epochs,
             "lr":           lr,
             "weight_decay": weight_decay,
             "batch_size":   batch_size,
-            # Parallelism
             "world_size":   world_size,
             "parallelism":  "solo" if world_size == 1 else "parameter_server",
-            # Dataset
             "dataset_samples": dataset_samples,
-            # Gradient
             "raw_gradient_numel":        raw_gradient_numel,
             "compressed_gradient_numel": self._compressed_gradient_numel,
-            # Bookkeeping
             "run_name":   run_name,
             "started_at": ts,
         }
-        (self.run_dir / "config.json").write_text(
-            json.dumps(self._config, indent=2)
-        )
+        (self.run_dir / "config.json").write_text(json.dumps(self._config, indent=2))
 
         self._csv_path = self.run_dir / "metrics.csv"
         self._csv_file = open(self._csv_path, "w", newline="")
         self._writer   = csv.writer(self._csv_file)
-        self._writer.writerow(
-            ["step", "loss", "round_ms", "straggler_delay_s", "epoch", "val_acc"]
-        )
+        self._writer.writerow(["step", "loss", "round_ms", "straggler_delay_s", "epoch", "val_acc"])
         self._csv_file.flush()
 
-        # Accumulators
         self._steps:    list[int]   = []
         self._losses:   list[float] = []
-        self._round_ms_list:     list[float] = []
-        self._straggler_delays:  list[float] = []
+        self._round_ms_list:    list[float] = []
+        self._straggler_delays: list[float] = []
         self._epoch_accs: list[tuple[int, float]] = []
         self._last_loss:    float          = 0.0
         self._last_val_acc: Optional[float] = None
 
-    # ── Public API ────────────────────────────────────────────────────────────
-
     def log_step(
         self,
-        step:               int,
-        loss:               float,
-        round_ms:           float = 0.0,
-        straggler_delay_s:  float = 0.0,
+        step:              int,
+        loss:              float,
+        round_ms:          float = 0.0,
+        straggler_delay_s: float = 0.0,
     ) -> None:
         self._steps.append(step)
         self._losses.append(loss)
@@ -124,12 +100,11 @@ class RunRecorder:
         self._csv_file.flush()
 
     def close(self) -> Path:
-        """Flush CSV, write summary.json, save loss.png. Returns run_dir."""
         self._csv_file.close()
 
-        duration_s    = time.monotonic() - self._start_time
-        total_steps   = len(self._steps)
-        avg_round_ms  = (
+        duration_s   = time.monotonic() - self._start_time
+        total_steps  = len(self._steps)
+        avg_round_ms = (
             sum(self._round_ms_list) / len(self._round_ms_list)
             if self._round_ms_list else 0.0
         )
@@ -137,7 +112,6 @@ class RunRecorder:
             self._dataset_samples // self._batch_size
             if self._batch_size > 0 else 0
         )
-        # Wall-clock throughput: total training samples / elapsed seconds
         samples_per_second = (
             (self._dataset_samples * self._epochs) / duration_s
             if duration_s > 0 and self._dataset_samples > 0 else 0.0
@@ -151,29 +125,21 @@ class RunRecorder:
 
         summary = {
             **self._config,
-            # Results
             "final_loss":    self._last_loss,
             "final_val_acc": self._last_val_acc,
             "total_steps":   total_steps,
             "epoch_accs":    self._epoch_accs,
-            # Throughput
             "duration_seconds":   round(duration_s, 2),
             "batches_per_epoch":  batches_per_epoch,
             "seconds_per_batch":  round(avg_round_ms / 1000.0, 4),
             "samples_per_second": round(samples_per_second, 2),
-            # Gradient compression
-            "compression_ratio": round(compression_ratio, 6),
-            # Straggler
+            "compression_ratio":  round(compression_ratio, 6),
             "straggler_delay_seconds":       round(straggler_delay_max, 4),
             "straggler_delay_total_seconds": round(straggler_delay_total, 4),
         }
-        (self.run_dir / "summary.json").write_text(
-            json.dumps(summary, indent=2)
-        )
+        (self.run_dir / "summary.json").write_text(json.dumps(summary, indent=2))
         self._save_loss_plot()
         return self.run_dir
-
-    # ── Private ───────────────────────────────────────────────────────────────
 
     def _save_loss_plot(self) -> None:
         if not self._steps:

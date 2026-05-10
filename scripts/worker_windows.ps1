@@ -8,8 +8,8 @@
 #   -LeaderPort <port>     Leader gRPC port.
 #   -SkipDataset           Do not pre-download the dataset.
 #   -SkipTailscale         Do not install/authenticate Tailscale.
-#   -DryRun                Tell worker.py to use synthetic data.
-#   -SetupOnly             Install/check dependencies, then exit before worker.py.
+#   -DryRun                Tell dtrain-worker to use synthetic data.
+#   -SetupOnly             Install/check dependencies, then exit before launching dtrain-worker.
 #   -NoInstall             Fail with instructions instead of installing missing tools.
 #
 # Environment variable equivalents are also supported:
@@ -439,8 +439,8 @@ function Ensure-Venv {
         Write-Step "PyTorch already installed"
     }
 
-    Write-Step "Installing project requirements"
-    Invoke-Ok $venvPython @("-m", "pip", "install", "-r", (Join-Path $RepoDir "requirements.txt"), "--quiet")
+    Write-Step "Installing package and dependencies"
+    Invoke-Ok $venvPython @("-m", "pip", "install", "-e", $RepoDir, "--quiet")
 
     return $venvPython
 }
@@ -485,11 +485,11 @@ function Ensure-Dataset {
 
     foreach ($datasetName in $DatasetList) {
         Write-Step "Checking $datasetName dataset"
-        $args = @((Join-Path $RepoDir "dataset.py"), "--dataset", $datasetName)
-        if ($CacheDir) { $args += @("--root", $CacheDir) }
-        & "$VenvPython" @args
+        $dsArgs = @("-c", "from trainer.data import ensure_any_dataset; ensure_any_dataset('$datasetName')")
+        if ($CacheDir) { $dsArgs = @("-c", "from trainer.data import ensure_any_dataset; ensure_any_dataset('$datasetName', '$CacheDir')") }
+        & "$VenvPython" @dsArgs
         if ($LASTEXITCODE -ne 0) {
-            Write-Warn "$datasetName setup failed; worker.py will retry if the leader requests it."
+            Write-Warn "$datasetName setup failed; dtrain-worker will retry if the leader requests it."
         }
     }
 }
@@ -498,7 +498,7 @@ function Show-Hardware {
     param([string]$VenvPython)
     Write-Step "Hardware detected"
     try {
-        & "$VenvPython" (Join-Path $RepoDir "hardware_probe.py") 2>$null |
+        & "$VenvPython" "-c" "from trainer.utils.hardware import probe_to_dict; import json; print(json.dumps(probe_to_dict(), indent=2))" 2>$null |
             Select-String '"score"|"type"|"name"|"cpu_cores"|"ram_gb"'
     } catch {
         Write-Warn "Hardware probe failed: $_"
@@ -513,7 +513,7 @@ function Test-LeaderPort {
         if ($ok) {
             Write-Step "Leader port is reachable"
         } else {
-            Write-Warn "Leader port is not reachable yet. worker.py will keep retrying."
+            Write-Warn "Leader port is not reachable yet. dtrain-worker will keep retrying."
         }
     } catch {
         Write-Warn "Leader reachability check failed: $_"
@@ -526,8 +526,10 @@ function Start-Worker {
     Show-Hardware $VenvPython
     Test-LeaderPort
 
+    $dtrain = Join-Path (Split-Path -Parent $VenvPython) "dtrain-worker.exe"
+    if (-not (Test-Path -LiteralPath $dtrain)) { $dtrain = Join-Path (Split-Path -Parent $VenvPython) "dtrain-worker" }
+
     $launchArgs = @(
-        (Join-Path $RepoDir "worker.py"),
         "--leader", $LeaderHost,
         "--port", "$LeaderPort",
         "--dataset", $Dataset,
@@ -539,7 +541,7 @@ function Start-Worker {
     if ($WorkerArgs) { $launchArgs += $WorkerArgs }
 
     Write-Step "Starting worker -> leader=${LeaderHost}:${LeaderPort}"
-    & "$VenvPython" @launchArgs
+    & "$dtrain" @launchArgs
     exit $LASTEXITCODE
 }
 

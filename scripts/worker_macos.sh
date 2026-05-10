@@ -181,8 +181,8 @@ ensure_venv() {
     log "PyTorch already installed"
   fi
 
-  log "Installing project requirements …"
-  "${VENV_DIR}/bin/python" -m pip install -r "${REPO_DIR}/requirements.txt" --quiet
+  log "Installing package and dependencies …"
+  "${VENV_DIR}/bin/python" -m pip install -e "${REPO_DIR}" --quiet
 }
 
 # ── Step 8: Proto stubs ───────────────────────────────────────────────────────
@@ -193,7 +193,7 @@ ensure_proto() {
     return
   fi
   log "Generating gRPC proto stubs …"
-  PYTHON="${VENV_DIR}/bin/python" bash "${REPO_DIR}/generate_proto.sh"
+  PYTHON="${VENV_DIR}/bin/python" bash "${REPO_DIR}/scripts/generate_proto.sh"
 }
 
 # ── Step 9: Dataset ───────────────────────────────────────────────────────────
@@ -204,18 +204,14 @@ ensure_dataset_download() {
     return
   fi
   log "Checking dataset …"
-  "${VENV_DIR}/bin/python" "${REPO_DIR}/dataset.py"
+  "${VENV_DIR}/bin/python" -c "from trainer.data import ensure_any_dataset; ensure_any_dataset('tinyimagenet')"
 }
 
 # ── Step 10: Launch worker ────────────────────────────────────────────────────
 
 launch_worker() {
-  log "Hardware detected:"
-  "${VENV_DIR}/bin/python" "${REPO_DIR}/hardware_probe.py" 2>/dev/null \
-    | grep -E '"score"|"type"|"name"|"forward_ms"' | head -10 || true
-
   log "Starting worker → leader=${LEADER_HOST}:${LEADER_PORT}"
-  exec "${VENV_DIR}/bin/python" "${REPO_DIR}/worker.py" \
+  exec "${VENV_DIR}/bin/dtrain-worker" \
     --leader "${LEADER_HOST}" \
     --port   "${LEADER_PORT}"
 }

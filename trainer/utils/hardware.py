@@ -1,9 +1,4 @@
-"""
-hardware_probe.py
-
-Detects hardware on the current machine and computes a capability score.
-Returns plain dataclasses — no gRPC dependency — so this can be tested standalone.
-"""
+"""trainer/utils/hardware — Hardware detection and benchmark scoring."""
 
 import platform
 import socket
@@ -24,7 +19,7 @@ class AccelType(str, Enum):
 class AcceleratorInfo:
     type:      AccelType
     name:      str
-    vram_gb:   float = 0.0   # unified memory devices report 0 here
+    vram_gb:   float = 0.0
     gpu_cores: int   = 0
     tflops:    float = 0.0
 
@@ -42,9 +37,9 @@ class HardwareInfo:
 
 @dataclass
 class BenchmarkResult:
-    score:          float   # composite (higher = more capable)
-    forward_ms:     float   # latency of microbenchmark forward pass
-    memory_free_gb: float   # free memory on primary accelerator
+    score:          float
+    forward_ms:     float
+    memory_free_gb: float
 
 
 @dataclass
@@ -53,45 +48,33 @@ class ProbeResult:
     benchmark: BenchmarkResult
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  Hardware detection
-# ─────────────────────────────────────────────────────────────────────────────
-
 def _detect_hardware() -> HardwareInfo:
     import torch
 
     hostname = socket.gethostname()
-    os_name  = platform.system().lower()   # "darwin", "windows", "linux"
+    os_name  = platform.system().lower()
 
-    # CPU / RAM
     cpu_cores = _logical_cpu_count()
     ram_gb    = _total_ram_gb()
 
     accelerators: list[AcceleratorInfo] = []
 
-    # CUDA GPUs
     if torch.cuda.is_available():
         for i in range(torch.cuda.device_count()):
             props = torch.cuda.get_device_properties(i)
             vram  = props.total_memory / (1024 ** 3)
-            # Rough FP32 TFLOPS from SM count and clock when PyTorch exposes
-            # clock data. Some Windows/CUDA builds omit max_clock_rate.
             max_clock_rate = getattr(props, "max_clock_rate", 0) or 0
             tflops = (props.multi_processor_count * max_clock_rate * 1e-6 * 2) / 1e3
             accelerators.append(AcceleratorInfo(
                 type      = AccelType.CUDA,
                 name      = props.name,
                 vram_gb   = round(vram, 2),
-                gpu_cores = props.multi_processor_count * 128,  # approx CUDA cores
+                gpu_cores = props.multi_processor_count * 128,
                 tflops    = round(tflops, 2),
             ))
-
-    # Apple MPS
     elif _mps_available():
-        info = _mps_info()
-        accelerators.append(info)
+        accelerators.append(_mps_info())
 
-    # Always include CPU as fallback accelerator entry
     accelerators.append(AcceleratorInfo(
         type      = AccelType.CPU,
         name      = platform.processor() or "Unknown CPU",
@@ -137,10 +120,6 @@ def _mps_available() -> bool:
 
 
 def _mps_info() -> AcceleratorInfo:
-    """
-    Apple doesn't expose GPU core count via PyTorch; use subprocess to query
-    system_profiler on macOS. Falls back to zero if unavailable.
-    """
     gpu_cores = 0
     name      = "Apple GPU (MPS)"
     try:
@@ -162,37 +141,30 @@ def _mps_info() -> AcceleratorInfo:
     return AcceleratorInfo(
         type      = AccelType.MPS,
         name      = name,
-        vram_gb   = 0.0,   # shares system RAM
+        vram_gb   = 0.0,
         gpu_cores = gpu_cores,
-        tflops    = 0.0,   # not reliably available
+        tflops    = 0.0,
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  Microbenchmark  (ResNet-18 forward on 16 images — fast but representative)
-# ─────────────────────────────────────────────────────────────────────────────
-
-_BENCH_BATCH = 16
+_BENCH_BATCH  = 16
 _BENCH_WARMUP = 3
 _BENCH_RUNS   = 10
 
 
 def _run_benchmark(device: "torch.device") -> tuple[float, float]:
-    """Returns (avg_forward_ms, free_memory_gb)."""
     import torch
     import torchvision.models as models
 
     model = models.resnet18(weights=None).to(device).eval()
     dummy = torch.randn(_BENCH_BATCH, 3, 64, 64, device=device)
 
-    # Warmup
     with torch.no_grad():
         for _ in range(_BENCH_WARMUP):
             _ = model(dummy)
 
     _sync(device)
 
-    # Timed runs
     times: list[float] = []
     with torch.no_grad():
         for _ in range(_BENCH_RUNS):
@@ -201,7 +173,7 @@ def _run_benchmark(device: "torch.device") -> tuple[float, float]:
             _sync(device)
             times.append((time.perf_counter() - t0) * 1000)
 
-    avg_ms = sum(times) / len(times)
+    avg_ms  = sum(times) / len(times)
     free_gb = _free_memory_gb(device)
 
     del model, dummy
@@ -223,7 +195,6 @@ def _free_memory_gb(device: "torch.device") -> float:
             free, _ = torch.cuda.mem_get_info(device)
             return free / (1024 ** 3)
         elif device.type == "mps":
-            # MPS uses unified memory; report free system RAM as proxy
             import psutil
             return psutil.virtual_memory().available / (1024 ** 3)
     except Exception:
@@ -240,16 +211,11 @@ def _primary_device() -> "torch.device":
     return torch.device("cpu")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  Scoring
-# ─────────────────────────────────────────────────────────────────────────────
-
-# Weights are intentionally tunable — change without touching the formula shape.
 _W_CPU_CORE  = 0.5
 _W_RAM       = 0.1
 _W_CUDA_VRAM = 8.0
 _W_MPS_CORES = 0.3
-_W_LATENCY   = 50.0  # contribution from benchmark latency (lower ms → higher score)
+_W_LATENCY   = 50.0
 
 
 def _compute_score(hw: HardwareInfo, forward_ms: float) -> float:
@@ -261,22 +227,13 @@ def _compute_score(hw: HardwareInfo, forward_ms: float) -> float:
         elif accel.type == AccelType.MPS:
             score += accel.gpu_cores * _W_MPS_CORES
 
-    # Latency bonus: treat 100ms as baseline; faster = higher bonus
     if forward_ms > 0:
         score += _W_LATENCY * (100.0 / forward_ms)
 
     return round(score, 3)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  Public API
-# ─────────────────────────────────────────────────────────────────────────────
-
 def probe() -> ProbeResult:
-    """
-    Run full hardware detection + benchmark.
-    Safe to call on macOS (MPS), Windows (CUDA), Linux (CUDA/CPU).
-    """
     hw     = _detect_hardware()
     device = _primary_device()
 
@@ -294,7 +251,6 @@ def probe() -> ProbeResult:
 
 
 def probe_to_dict(result: Optional[ProbeResult] = None) -> dict:
-    """Serialise ProbeResult to a plain dict (for logging / gRPC construction)."""
     r = result or probe()
     return {
         "hw": {
@@ -321,25 +277,3 @@ def probe_to_dict(result: Optional[ProbeResult] = None) -> dict:
             "memory_free_gb": r.benchmark.memory_free_gb,
         },
     }
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Standalone test
-# ─────────────────────────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    import json
-
-    print("=" * 60)
-    print("Hardware Probe")
-    print("=" * 60)
-
-    result = probe()
-    data   = probe_to_dict(result)
-
-    print(json.dumps(data, indent=2))
-    print()
-    print(f"  Composite score : {result.benchmark.score}")
-    print(f"  Benchmark       : {result.benchmark.forward_ms} ms / forward pass")
-    print(f"  Free memory     : {result.benchmark.memory_free_gb} GB")
-    print(f"  Primary device  : {_primary_device()}")

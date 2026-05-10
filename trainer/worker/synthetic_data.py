@@ -7,7 +7,7 @@ from __future__ import annotations
 import torch
 import torch.utils.data
 
-from dataset import IMG_SIZE, NUM_CLASSES
+from trainer.data import IMG_SIZE, NUM_CLASSES
 
 
 class SyntheticDataset(torch.utils.data.Dataset):

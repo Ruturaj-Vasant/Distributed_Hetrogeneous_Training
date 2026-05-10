@@ -24,7 +24,7 @@ import torch
 import torch.nn as nn
 import torchvision.models as models
 
-from dataset import make_any_val_loader
+from trainer.data import make_any_val_loader
 from proto import trainer_pb2
 from trainer.leader.worker_state import WorkerState, infer_device
 from trainer.core.logging import get as _get_log

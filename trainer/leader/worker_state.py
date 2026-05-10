@@ -28,6 +28,8 @@ class WorkerState:
     shard_indices:     list  = field(default_factory=list)
     local_batch_size:  int   = 32
     assigned:          bool  = False
+    last_loss:         float = 0.0
+    steps:             int   = 0
 
     cmd_queue:        asyncio.Queue = field(default_factory=asyncio.Queue)
     assignment_queue: asyncio.Queue = field(default_factory=asyncio.Queue)

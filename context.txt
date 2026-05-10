@@ -19,11 +19,16 @@ GitHub Pages: https://ruturaj-vasant.github.io/Distributed_Hetrogeneous_Training
 
 # CURRENT STATUS (2026-05-09)
 
-Phase 1 modularization complete. The flat leader.py/worker.py monoliths have been
-extracted into a structured trainer/ package. Entry points are now thin wrappers.
-All 5 e2e tests passing (17 assertions).
+Phase 1 + Phase 2 A/B/C/D/E complete. Full package restructure done:
+- trainer/data/ (tinyimagenet.py + cifar10.py) replaces root dataset.py
+- trainer/utils/ (hardware.py + recorder.py) replaces root hardware_probe.py + run_recorder.py
+- cli/ (leader_cli.py + worker_cli.py) provides formal CLI layer
+- pyproject.toml — pip-installable with dtrain-leader / dtrain-worker entry points
+- Root files dataset.py, hardware_probe.py, run_recorder.py deleted
+- All 5 e2e tests passing (17 assertions) via pytest or python3 tests/test_e2e.py
+- pytest-asyncio added as dev dep; tests/conftest.py provides port fixture
 
-Phase 2 (product layer: pyproject.toml, cli/, examples/, dashboard) is next.
+Phase 2 D/E/F complete: examples labs, docs expansion, and dashboard are in place.
 
 Latest commits:
   ae2710d — fix(tests): move to tests/, fix pre-existing MPS crash + T11 pool bug
@@ -37,14 +42,17 @@ Latest commits:
    Register, Heartbeat (bidi stream), GetAssignment, ExchangeGradients,
    GetClusterStatus, AdmitWorkers
 
-2. hardware_probe.py — cross-platform HW detection + microbenchmark score
+2. trainer/utils/hardware.py — cross-platform HW detection + microbenchmark score
    Score formula: cpu_cores×0.5 + ram×0.1 + cuda_vram×8 + mps_cores×0.3 + 50×(100/forward_ms)
+   (Previously root hardware_probe.py)
 
-3. dataset.py — Tiny ImageNet-200 + CIFAR-10 download/extract/reorganize
-   ensure_dataset(), make_train_loader(), make_val_loader() for Tiny ImageNet
-   ensure_cifar10(), make_cifar10_train_loader(), make_cifar10_val_loader() for CIFAR-10
-   Unified interface: ensure_any_dataset(), make_any_train_loader(), make_any_val_loader()
+3. trainer/data/ — Tiny ImageNet-200 + CIFAR-10 download/extract/reorganize
+   tinyimagenet.py: ensure_dataset(), make_train_loader(), make_val_loader()
+   cifar10.py: ensure_cifar10(), make_cifar10_train_loader(), make_cifar10_val_loader()
+   __init__.py: unified interface — get_dataset_info(), ensure_any_dataset(),
+               make_any_train_loader(), make_any_val_loader()
    Cache: ~/.cache/tiny-imagenet-200 (~236 MB), ~/.cache/cifar10
+   (Previously root dataset.py)
 
 4. trainer/ package — Phase 1 modularization (2026-05-09)
 
@@ -74,22 +82,25 @@ Latest commits:
      proto_helpers.py hw_to_proto(), resolve_device(), parse_dataset_list()
      runner.py       run(cfg) — outer reconnect + job loop, orchestrates all worker modules
 
-5. leader.py — thin entry point (~40 lines): argparse + asyncio.run(main(cfg))
-   All logic lives in trainer/leader/
+5. [Claude] cli/ layer + entry points — leader.py / worker.py deleted; replaced by:
+   cli/leader_cli.py  all argparse for dtrain-leader, calls trainer.leader.server.main()
+   cli/worker_cli.py  all argparse for dtrain-worker, calls trainer.worker.runner.run()
+   Flags: --dashboard-port 8080, --no-dashboard (headless/CI), all original training flags
 
-6. worker.py — thin entry point (~50 lines): bootstrap() + argparse + asyncio.run(run(cfg))
-   All logic lives in trainer/worker/
-
-7. run_recorder.py — per-run metrics logger
+6. [Claude] trainer/utils/recorder.py — per-run metrics logger (previously root run_recorder.py)
    Creates: runs/<model>__<dataset>__<optimizer>__topk<K>__<timestamp>/
    Writes: config.json, metrics.csv (step, loss, round_ms, epoch, val_acc), summary.json, loss.png
 
-8. run_experiments.py — comparison/plotting tool
-   --list: show all runs under runs/
-   --runs dir1 dir2 dir3 --labels "EXP1" "EXP2" "EXP3": generates comparison.png
+8. [Claude] pyproject.toml — pip-installable package
+    Entry points: dtrain-leader  → cli.leader_cli:cli_main
+                  dtrain-worker  → cli.worker_cli:cli_main
+                  dtrain-watch   → cli.watch_cluster:main
+                  dtrain-compare → cli.run_experiments:main
+    Deps: torch, torchvision, grpcio, grpcio-tools, protobuf, psutil, rich, fastapi, uvicorn
+    Dev deps: pytest, pytest-asyncio (asyncio_mode=auto, asyncio_default_fixture_loop_scope=function)
 
-9. watch_cluster.py — live cluster monitor
-   Polls GetClusterStatus every N seconds, prints worker table
+9. [Claude] cli/run_experiments.py — dtrain-compare: list runs, generate comparison.png
+   cli/watch_cluster.py — dtrain-watch: live cluster terminal monitor (rich table)
 
 10. docs/index.html — GitHub Pages command reference (dark brutalist design)
     URL: https://ruturaj-vasant.github.io/Distributed_Hetrogeneous_Training/
@@ -100,7 +111,8 @@ Latest commits:
     T9:    two workers 75/25 proportional shard split, both complete 3 steps
     T10:   late worker admission + Phase-2 reshard (shard shrinks 100k→66k)
     T11-12: GetClusterStatus RPC returns workers in admitted and pending pools
-    Run: python3 tests/test_e2e.py   OR   python -m pytest tests/
+    Run: python3 tests/test_e2e.py   OR   python3 -m pytest tests/
+    tests/conftest.py provides port fixture (increments from 50099 per test)
 
 12. scripts/
     worker_macos.sh       Mac one-shot bootstrap
@@ -108,78 +120,95 @@ Latest commits:
     worker_windows.sh     Windows bash alternative
     generate_proto.sh     Regenerate proto stubs after editing .proto
 
+13. examples/ — classroom labs
+    [TAG: codex-p2d-p2e-2026-05-09]
+    lab01_single_worker/README.md      Solo baseline: one machine, leader + worker, full gradients
+    lab02_two_workers/README.md        Two-machine parameter-server run, full gradients (--topk 0)
+    lab03_topk_compression/README.md   Two-machine TopK run (--topk 5000) and comparison flow
 
-# PHASE 2 PLAN (next session)
+14. docs/ expansion
+    [TAG: codex-p2d-p2e-2026-05-09]
+    architecture.md       Parameter-server design, 6 RPCs, training-step flow, sharding,
+                          Phase-2 resharding, worker channel design
+    deployment.md         Tailscale setup, Mac/Windows install, CUDA PyTorch note,
+                          proto regeneration, leader/worker launch, troubleshooting
+    index.html            Updated GitHub Pages command reference to dtrain-* entry points,
+                          dashboard URL, dtrain-watch, and dtrain-compare
 
-Goal: make this a product — pip-installable, unified CLI, classroom examples, dashboard.
 
-P2-A: pyproject.toml + package install
-  - pip install -e . → dtrain-leader / dtrain-worker entry points (no PYTHONPATH fiddling)
-  - Replaces current argparse blocks in leader.py / worker.py
-  - Entry points call trainer.leader.server.main() and trainer.worker.runner.run()
+# PHASE 2 PLAN
 
-P2-B: Move remaining root modules into trainer/
-  - dataset.py       → trainer/data/ (split into tinyimagenet.py + cifar10.py + __init__)
-  - hardware_probe.py → trainer/utils/hardware.py
-  - run_recorder.py  → trainer/utils/recorder.py
-  - Update all import sites inside trainer/ (6 files)
-  - After this: project root has only entry points + config + docs dirs
+P2-A/B/C: COMPLETE (2026-05-09)
+  ✓ pyproject.toml with dtrain-leader / dtrain-worker entry points
+  ✓ trainer/data/ (tinyimagenet.py + cifar10.py) replaces root dataset.py
+  ✓ trainer/utils/ (hardware.py + recorder.py) replaces root hardware_probe.py + run_recorder.py
+  ✓ cli/leader_cli.py + cli/worker_cli.py — formal CLI layer
+  ✓ All imports updated, old root files deleted, tests passing
 
-P2-C: cli/ directory (formal CLI layer)
-  - cli/leader_cli.py  — argument parsing + calls trainer.leader.server.main()
-  - cli/worker_cli.py  — argument parsing + calls trainer.worker.runner.run()
-  - Decoupled from trainer/ internals, testable in isolation
+P2-D: COMPLETE (2026-05-09)
+  ✓ examples/lab01_single_worker/README.md — EXP1 solo baseline
+  ✓ examples/lab02_two_workers/README.md — EXP2 PS full gradients
+  ✓ examples/lab03_topk_compression/README.md — EXP3 PS TopK compression
 
-P2-D: examples/ directory (classroom labs)
-  - examples/lab01_single_worker/    README + run script (EXP1 solo baseline)
-  - examples/lab02_two_workers/      README + run script (EXP2 PS full grads)
-  - examples/lab03_topk/             README + run script (EXP3 PS TopK)
+P2-E: COMPLETE (2026-05-09)
+  ✓ docs/architecture.md — system design, gRPC flow, sharding math
+  ✓ docs/deployment.md — Tailscale setup, Windows CUDA guide, Mac MPS guide
+  ✓ docs/index.html — updated to dtrain-leader, dtrain-worker, dtrain-watch, dtrain-compare
 
-P2-E: docs/ expansion
-  - docs/architecture.md     system design, gRPC flow, sharding math
-  - docs/deployment.md       Tailscale setup, Windows CUDA guide, Mac MPS guide
-  - docs/index.html          update to reflect new CLI commands (dtrain-leader etc.)
+P2-F: [Claude] trainer/dashboard/ — COMPLETE
+  - FastAPI + WebSocket on :8080 (--dashboard-port to override), alongside gRPC on :50051
+  - trainer/dashboard/server.py: FastAPI app, _snapshot(), _broadcast_loop(), REST + WS endpoints
+  - trainer/dashboard/static/index.html: dark-themed single-page app
+    Stats bar (phase/epoch/step/loss/workers), live loss canvas chart, worker table,
+    pending-workers table with per-worker Admit button, Start/Admit-All/Reset controls
+  - WebSocket schema: {type, ts, phase, step, epoch, loss, workers[], pending[], cfg{}}
+  - REST: POST /api/start, POST /api/reset, POST /api/admit {worker_ids:[]}
+        GET /api/history → {loss:[...]} — server buffers 2000 points, survives page refresh
+  - --no-dashboard flag: skips web server entirely for headless/CI runs
+  - WorkerState gains last_loss + steps fields; Heartbeat handler stores them
+  - Tested: GET /, WS /ws, GET /api/history, POST /api/start, POST /api/reset all pass
 
-P2-F: trainer/dashboard/ — web UI (auto-opens when leader starts)
-  - FastAPI + WebSocket server on :8080, launched alongside gRPC on :50051
-  - Live worker table replacing watch_cluster.py
-  - Loss curve, step/epoch progress, straggler heatmap
-  - Leader CLI buttons (admit, start, reset) replacing terminal prompt
+P2-D: [Codex] examples/ — COMPLETE
+  ✓ examples/lab01_single_worker/README.md — solo baseline, correct Tailscale DNS, dtrain-* commands
+  ✓ examples/lab02_two_workers/README.md  — two-machine PS full gradients
+  ✓ examples/lab03_topk_compression/README.md — TopK, compression_ratio, three-way compare
+
+P2-E: [Codex] docs/ expansion — COMPLETE
+  ✓ docs/architecture.md — PS design, 6 RPCs, training-step flow, sharding math, Phase-2 reshard
+  ✓ docs/deployment.md   — Tailscale, Mac install, Windows CUDA, proto stubs, troubleshooting
+  ✓ docs/index.html      — updated to dtrain-* entry points, dashboard URL, dtrain-watch/compare
 
 
 # EXPERIMENT PLAN
 
 EXP1 — Solo baseline
-  Terminal 1: python3 leader.py --model resnet18 --epochs 5 --lr 0.01 --batch-size 32 --topk 0
-  Terminal 2: python3 worker.py
+  Terminal 1: dtrain-leader --model resnet18 --epochs 5 --lr 0.01 --batch-size 32 --topk 0
+  Terminal 2: dtrain-worker --leader leader-macbook-pro.taila5426e.ts.net
   Type: start
   Measures: time/epoch, val-acc, loss curve — no network overhead
 
 EXP2 — PS full gradients (two machines)
-  Terminal 1: python3 leader.py --model resnet18 --epochs 5 --lr 0.01 --batch-size 32 --topk 0
-  Terminal 2: python3 worker.py
-  Friend's Mac: python3 worker.py   (self-bootstraps on clone)
+  Terminal 1: dtrain-leader --model resnet18 --epochs 5 --lr 0.01 --batch-size 32 --topk 0
+  Terminal 2: dtrain-worker --leader leader-macbook-pro.taila5426e.ts.net
+  Friend's Mac: dtrain-worker --leader leader-macbook-pro.taila5426e.ts.net
   Type: start
   Measures: speedup vs EXP1, round_ms from latency logs
 
 EXP3 — PS TopK sparsification (same topology as EXP2)
-  Terminal 1: python3 leader.py --model resnet18 --epochs 5 --lr 0.01 --batch-size 32 --topk 5000
+  Terminal 1: dtrain-leader --model resnet18 --epochs 5 --lr 0.01 --batch-size 32 --topk 5000
   Type: start  (workers reconnect automatically after leader restart)
   Measures: accuracy delta vs EXP2, gradient payload size, round_ms improvement
 
 After all 3 runs:
-  python3 run_experiments.py --list
-  python3 run_experiments.py --runs <exp1_dir> <exp2_dir> <exp3_dir> \
+  dtrain-compare --list
+  dtrain-compare --runs <exp1_dir> <exp2_dir> <exp3_dir> \
     --labels "EXP1 Solo" "EXP2 PS Full" "EXP3 PS TopK" --output comparison.png
 
 
 # IN-PROGRESS WORK
 
-Phase 2 is next. Priority order: P2-A (pyproject.toml) → P2-B (move modules) →
-P2-C (cli/) → P2-F (dashboard) → P2-D (examples) → P2-E (docs expansion).
-
-P2-A and P2-B must happen together in one PR since pyproject.toml references
-the final package paths.
+P2-F (dashboard): COMPLETE (2026-05-09)
+P2-D (examples) and P2-E (docs expansion): COMPLETE (2026-05-09)
 
 
 # TECHNICAL ARCHITECTURE
@@ -258,9 +287,10 @@ ALWAYS use the Tailscale magic DNS — never 127.0.0.1 or localhost, even for lo
    unchanged — zero risk of attribute bugs when splitting the class.
 
 6. Worker bootstrap (trainer/worker/bootstrap.py): stdlib-only, runs before third-party
-   imports. Creates .venv, installs requirements.txt, generates proto stubs, re-execs
-   inside venv via os.execv (Mac/Linux) or subprocess.run (Windows).
-   Deps skip: MD5 of requirements.txt cached in .venv/.deps_hash.
+   imports. Creates .venv, runs pip install -e ., generates proto stubs, re-execs inside
+   venv via os.execv (Mac/Linux) or subprocess.run (Windows).
+   NOTE: bootstrap is only used by scripts/ (one-shot fresh-clone setup). The normal
+   path is `pip install -e .` which creates dtrain-* entry points directly.
 
 7. Late worker joining: accepted mid-run, gets proportional random shard + current weights.
    _count_alive() excludes unassigned workers so they don't block existing grad rounds.
@@ -276,10 +306,15 @@ ALWAYS use the Tailscale magic DNS — never 127.0.0.1 or localhost, even for lo
 
 # IMPORTANT COMMANDS
 
+## Install as package (once per machine, after fresh clone)
+pip install -e ".[dev]"            # installs dtrain-leader, dtrain-worker + pytest-asyncio
+
 ## Leader (always from project dir)
 cd /Users/ruturaj_vasant/Desktop/Academic/AI_New/distributed-resnet
 git pull
-python3 leader.py --model resnet18 --epochs 5 --lr 0.01 --batch-size 32
+dtrain-leader --model resnet18 --epochs 5 --lr 0.01 --batch-size 32
+# Dashboard auto-launches at http://localhost:8080
+# Override port: dtrain-leader ... --dashboard-port 9090
 
 ## Leader flags
 --model resnet18/50/101    (default resnet101)
@@ -292,25 +327,27 @@ python3 leader.py --model resnet18 --epochs 5 --lr 0.01 --batch-size 32
 --auto-start               (start when min-workers threshold met)
 --grad-accum N             (accumulate N batches before syncing, default 1)
 
-## Worker (any machine — self-bootstraps)
-python3 worker.py                    (connects to leader-macbook-pro.taila5426e.ts.net)
-python3 worker.py --dry-run          (synthetic data, tests protocol only)
-python3 worker.py --dataset cifar10  (pre-download CIFAR-10 instead)
+## Worker (any machine)
+dtrain-worker --leader leader-macbook-pro.taila5426e.ts.net
+dtrain-worker --leader leader-macbook-pro.taila5426e.ts.net --dry-run
+dtrain-worker --leader leader-macbook-pro.taila5426e.ts.net --dataset cifar10
 
 ## Fresh clone on remote machine (Mac)
 git clone https://github.com/Ruturaj-Vasant/Distributed_Hetrogeneous_Training.git ~/distributed-resnet
-cd ~/distributed-resnet && python3 worker.py
+cd ~/distributed-resnet && pip install -e ".[dev]"
+dtrain-worker --leader leader-macbook-pro.taila5426e.ts.net
 
 ## Fresh clone on remote machine (Windows)
 git clone https://github.com/Ruturaj-Vasant/Distributed_Hetrogeneous_Training.git $HOME\distributed-resnet
-cd $HOME\distributed-resnet && python worker.py
+cd $HOME\distributed-resnet && pip install -e ".[dev]"
+dtrain-worker --leader leader-macbook-pro.taila5426e.ts.net
 
 ## Watch cluster (any terminal, any machine)
-python3 watch_cluster.py   (default leader: leader-macbook-pro.taila5426e.ts.net)
+dtrain-watch --leader leader-macbook-pro.taila5426e.ts.net
 
 ## Compare experiment results
-python3 run_experiments.py --list
-python3 run_experiments.py --runs <dir1> <dir2> <dir3> --labels "EXP1" "EXP2" "EXP3"
+dtrain-compare --list
+dtrain-compare --runs <dir1> <dir2> <dir3> --labels "EXP1" "EXP2" "EXP3"
 
 ## Tests
 python3 tests/test_e2e.py            (5 tests, 17 assertions, ~20 seconds)
@@ -327,37 +364,49 @@ nc -zv leader-macbook-pro.taila5426e.ts.net 50051
 # FILE LAYOUT
 
 distributed-resnet/
-├── leader.py              # Thin entry point: argparse + asyncio.run(main(cfg))
-├── worker.py              # Thin entry point: bootstrap() + argparse + asyncio.run(run(cfg))
-├── run_recorder.py        # Per-run metrics logger               [→ trainer/utils/ in Phase 2]
-├── run_experiments.py     # Comparison/plotting tool             [→ cli/ in Phase 2]
-├── hardware_probe.py      # Cross-platform HW detection + score  [→ trainer/utils/ in Phase 2]
-├── dataset.py             # Tiny ImageNet-200 + CIFAR-10         [→ trainer/data/ in Phase 2]
-├── watch_cluster.py       # Live cluster status monitor          [replaced by dashboard Phase 2]
+├── pyproject.toml         # pip-installable; dtrain-leader/worker/watch/compare entry points
+├── requirements.txt       # legacy dep list (pyproject.toml is authoritative)
 ├── context.txt            # THIS FILE — project memory
-├── requirements.txt       # torch, torchvision, grpcio, psutil, numpy, matplotlib
 │
-├── trainer/               # Core package (Phase 1)
+├── cli/
+│   ├── leader_cli.py      # [Claude] argparse for dtrain-leader + cli_main()
+│   ├── worker_cli.py      # [Claude] argparse for dtrain-worker + cli_main()
+│   ├── watch_cluster.py   # dtrain-watch live cluster status monitor (rich table)
+│   └── run_experiments.py # dtrain-compare comparison/plotting tool
+│
+├── trainer/               # Core package [Claude]
 │   ├── core/
 │   │   ├── errors.py      # Custom exceptions + gRPC → human error translation
 │   │   └── logging.py     # Centralized logging config
+│   ├── data/
+│   │   ├── tinyimagenet.py  # TinyImageNet-200 download + loaders
+│   │   ├── cifar10.py       # CIFAR-10 download + loaders
+│   │   └── __init__.py      # Unified interface
+│   ├── utils/
+│   │   ├── hardware.py      # AccelType, HardwareInfo, probe(), probe_to_dict()
+│   │   ├── recorder.py      # RunRecorder — per-run CSV/JSON/PNG logger
+│   │   └── __init__.py
+│   ├── dashboard/           # [Claude]
+│   │   ├── server.py        # FastAPI app, WebSocket broadcast, REST API
+│   │   └── static/index.html  # Dark SPA: stats bar, loss chart, worker table, controls
 │   ├── leader/
-│   │   ├── worker_state.py  # WorkerState dataclass + infer_device()
+│   │   ├── worker_state.py  # WorkerState dataclass (last_loss + steps added for dashboard)
 │   │   ├── core.py          # LeaderCore mixin (model, aggregation, sharding, val)
 │   │   ├── service.py       # LeaderService(LeaderCore, gRPC) — RPC handlers only
-│   │   └── server.py        # main(), cli_loop(), kill_existing_leader()
+│   │   └── server.py        # main(), cli_loop(), kill_existing_leader(), dashboard launch
 │   └── worker/
 │       ├── bootstrap.py     # stdlib-only venv + proto setup
 │       ├── connection.py    # gRPC channel factories + connect_and_register()
 │       ├── gradients.py     # compress_gradients, apply_delta, load_full_weights
 │       ├── heartbeat.py     # WorkerSharedState + heartbeat_loop()
 │       ├── training_loop.py # training_loop() — inner for-loop
-│       ├── synthetic_data.py  # SyntheticDataset + make_synthetic_loader()
-│       ├── proto_helpers.py   # hw_to_proto, resolve_device, parse_dataset_list
-│       └── runner.py          # run(cfg) — outer reconnect + job loop
+│       ├── synthetic_data.py
+│       ├── proto_helpers.py
+│       └── runner.py        # run(cfg) — outer reconnect + job loop
 │
 ├── tests/
-│   └── test_e2e.py        # 5 tests, 17 assertions (python3 tests/test_e2e.py)
+│   ├── conftest.py        # port fixture (increments from 50099)
+│   └── test_e2e.py        # 5 tests, 17 assertions
 │
 ├── proto/
 │   ├── trainer.proto
@@ -365,13 +414,21 @@ distributed-resnet/
 │   └── trainer_pb2_grpc.py
 │
 ├── scripts/
-│   ├── worker_macos.sh
-│   ├── worker_windows.ps1
-│   ├── worker_windows.sh
-│   └── generate_proto.sh  # Regenerate stubs after editing .proto
+│   ├── worker_macos.sh    # [Claude] updated: pip install -e ., dtrain-worker
+│   ├── worker_windows.ps1 # [Claude] updated: pip install -e ., dtrain-worker
+│   ├── worker_windows.sh  # [Claude] updated
+│   └── generate_proto.sh
 │
-└── docs/
-    └── index.html         # GitHub Pages command reference
+├── examples/              # [Codex]
+│   ├── lab01_single_worker/README.md
+│   ├── lab02_two_workers/README.md
+│   └── lab03_topk_compression/README.md
+│
+└── docs/                  # [Codex] + existing
+    ├── index.html         # GitHub Pages (updated to dtrain-* commands)
+    ├── architecture.md    # System design and data flow
+    ├── deployment.md      # Setup/deployment guide
+    └── HOW_IT_WORKS.md    # Original deep-dive (moved from root)
 
 
 # KNOWN ISSUES / RISKS

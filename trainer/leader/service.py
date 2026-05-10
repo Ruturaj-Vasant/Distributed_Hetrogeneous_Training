@@ -15,8 +15,8 @@ import torch.nn as nn
 import grpc
 
 from proto import trainer_pb2, trainer_pb2_grpc
-from dataset import get_dataset_info
-from run_recorder import RunRecorder
+from trainer.data import get_dataset_info
+from trainer.utils.recorder import RunRecorder
 from trainer.leader.core import LeaderCore
 from trainer.leader.worker_state import WorkerState, infer_device
 from trainer.core.logging import get as _get_log
@@ -157,6 +157,9 @@ class LeaderService(LeaderCore, trainer_pb2_grpc.TrainerServiceServicer):
 
                 w.last_heartbeat = time.monotonic()
                 w.status         = req.status
+                if req.current_loss >= 0:
+                    w.last_loss = req.current_loss
+                w.steps = req.steps_completed
 
                 cmd = trainer_pb2.HeartbeatResponse.CONTINUE
                 try:

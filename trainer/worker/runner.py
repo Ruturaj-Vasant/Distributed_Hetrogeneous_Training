@@ -11,8 +11,8 @@ import torch
 import torchvision.models as models
 
 from proto import trainer_pb2, trainer_pb2_grpc
-from dataset import ensure_any_dataset, make_any_train_loader, get_dataset_info
-from hardware_probe import probe
+from trainer.data import ensure_any_dataset, make_any_train_loader, get_dataset_info
+from trainer.utils.hardware import probe
 
 from trainer.worker.connection import connect_and_register
 from trainer.worker.heartbeat import WorkerSharedState, heartbeat_loop

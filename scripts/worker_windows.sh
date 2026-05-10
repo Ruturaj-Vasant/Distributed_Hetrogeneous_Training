@@ -206,8 +206,8 @@ ensure_venv() {
         log "PyTorch already installed"
     fi
 
-    log "Installing project requirements …"
-    "$(venv_py)" -m pip install -r "${REPO_DIR}/requirements.txt" --quiet
+    log "Installing package and dependencies …"
+    "$(venv_py)" -m pip install -e "${REPO_DIR}" --quiet
 }
 
 # ── Step 7: Proto stubs ───────────────────────────────────────────────────────
@@ -237,19 +237,15 @@ ensure_dataset() {
         log "Skipping dataset download (SKIP_DATASET=1)"; return
     fi
     log "Checking dataset …"
-    "$(venv_py)" "${REPO_DIR}/dataset.py" \
+    "$(venv_py)" -c "from trainer.data import ensure_any_dataset; ensure_any_dataset('tinyimagenet')" \
         || log "Dataset download will be retried by the worker on first run."
 }
 
 # ── Step 9: Launch worker ─────────────────────────────────────────────────────
 
 launch_worker() {
-    log "Hardware detected:"
-    "$(venv_py)" "${REPO_DIR}/hardware_probe.py" 2>/dev/null \
-        | grep -E '"score"|"type"|"name"' | head -10 || true
-
     log "Starting worker → leader=${LEADER_HOST}:${LEADER_PORT}"
-    exec "$(venv_py)" "${REPO_DIR}/worker.py" \
+    exec "${VENV_DIR}/Scripts/dtrain-worker" \
         --leader "${LEADER_HOST}" \
         --port   "${LEADER_PORT}"
 }

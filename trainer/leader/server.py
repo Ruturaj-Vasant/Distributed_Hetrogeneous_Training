@@ -13,6 +13,7 @@ from grpc import aio
 from proto import trainer_pb2, trainer_pb2_grpc
 from trainer.leader.service import LeaderService
 from trainer.core.logging import setup as _setup_log
+from trainer.dashboard import serve as _dashboard_serve
 
 log = _setup_log("leader")
 
@@ -137,6 +138,11 @@ async def main(cfg) -> None:
 
     asyncio.create_task(service.heartbeat_monitor())
     asyncio.create_task(service.status_printer())
+
+    if not getattr(cfg, "no_dashboard", False):
+        dashboard_port = getattr(cfg, "dashboard_port", 8080)
+        await _dashboard_serve(service, port=dashboard_port)
+        log.info(f"Dashboard        : http://localhost:{dashboard_port}")
 
     if sys.stdin.isatty():
         try:

@@ -1,28 +1,13 @@
-"""
-worker.py — Distributed training worker entry point.
-
-Usage:
-    python3 worker.py --leader leader-macbook-pro.taila5426e.ts.net
-
-After `pip install -e .` (Phase 2):
-    dtrain-worker --leader <host>
-
-Bootstrap note: the first import below is stdlib-only and creates the .venv +
-installs dependencies if this is a fresh clone, then re-execs inside the venv.
-"""
-# Bootstrap MUST run before any third-party imports.
-from trainer.worker.bootstrap import bootstrap as _bootstrap
-_bootstrap()
-
-# Third-party imports are now safe (we are inside the venv).
+"""cli/worker_cli — Argument parsing and entry point for the worker."""
 import argparse
 import asyncio
 import sys
 
 from trainer.worker.runner import run
 
-if __name__ == "__main__":
-    p = argparse.ArgumentParser(description="Distributed ResNet — Worker")
+
+def _build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="dtrain-worker — Distributed ResNet Worker")
     p.add_argument(
         "--leader",
         default="leader-macbook-pro.taila5426e.ts.net",
@@ -65,8 +50,11 @@ if __name__ == "__main__":
         "--max-retry-backoff", type=float, default=15.0, dest="max_retry_backoff",
         help="Maximum seconds to sleep between retries",
     )
-    cfg = p.parse_args()
+    return p
 
+
+def cli_main() -> None:
+    cfg = _build_parser().parse_args()
     try:
         asyncio.run(run(cfg))
     except KeyboardInterrupt:

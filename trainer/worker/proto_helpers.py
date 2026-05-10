@@ -6,7 +6,7 @@ from __future__ import annotations
 import torch
 
 from proto import trainer_pb2
-from hardware_probe import AccelType
+from trainer.utils.hardware import AccelType
 from trainer.core.logging import get as _get_log
 
 log = _get_log("worker")

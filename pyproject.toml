@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "dtrain"
+version = "0.1.0"
+description = "Distributed parameter-server ResNet training over heterogeneous hardware"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "torch>=2.1",
+    "torchvision>=0.16",
+    "grpcio>=1.60",
+    "grpcio-tools>=1.60",
+    "protobuf>=4.25",
+    "psutil>=5.9",
+    "rich>=13.0",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-asyncio>=0.23",
+    "matplotlib>=3.7",
+]
+
+[project.scripts]
+dtrain-leader  = "cli.leader_cli:cli_main"
+dtrain-worker  = "cli.worker_cli:cli_main"
+dtrain-watch   = "cli.watch_cluster:main"
+dtrain-compare = "cli.run_experiments:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["trainer*", "cli*", "proto*"]
+
+[tool.setuptools.package-data]
+"proto" = ["*.proto"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"

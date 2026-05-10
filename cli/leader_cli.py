@@ -1,12 +1,4 @@
-"""
-leader.py — Parameter-server entry point.
-
-Usage:
-    python3 leader.py [--port 50051] [--min-workers 1] [--epochs 90]
-
-After `pip install -e .` (Phase 2):
-    dtrain-leader [options]
-"""
+"""cli/leader_cli — Argument parsing and entry point for the leader (parameter server)."""
 import argparse
 import asyncio
 
@@ -17,8 +9,9 @@ from trainer.leader.server import (
     _DEFAULT_GRAD_SYNC_TIMEOUT,
 )
 
-if __name__ == "__main__":
-    p = argparse.ArgumentParser(description="Distributed ResNet — Leader / Parameter Server")
+
+def _build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="dtrain-leader — Distributed ResNet Parameter Server")
     p.add_argument("--port",         type=int,   default=50051)
     p.add_argument("--min-workers",  type=int,   default=1,    dest="min_workers",
                    help="Minimum workers before auto-start triggers")
@@ -52,5 +45,13 @@ if __name__ == "__main__":
                    help="Path to dataset cache (default: ~/.cache/tiny-imagenet-200)")
     p.add_argument("--runs-root",    default="runs",           dest="runs_root",
                    help="Directory for run artifacts (default: runs/)")
-    cfg = p.parse_args()
+    p.add_argument("--dashboard-port", type=int, default=8080, dest="dashboard_port",
+                   help="Port for the web dashboard (default: 8080)")
+    p.add_argument("--no-dashboard", action="store_true", dest="no_dashboard",
+                   help="Disable the web dashboard (useful for headless/CI runs)")
+    return p
+
+
+def cli_main() -> None:
+    cfg = _build_parser().parse_args()
     asyncio.run(main(cfg))
