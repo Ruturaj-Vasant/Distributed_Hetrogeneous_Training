@@ -4,7 +4,8 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PROTO_DIR="${SCRIPT_DIR}/proto"
+PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+PROTO_DIR="${PROJECT_DIR}/proto"
 PYTHON="${PYTHON:-python3}"
 
 "${PYTHON}" -m grpc_tools.protoc \
@@ -17,9 +18,9 @@ PYTHON="${PYTHON:-python3}"
 GRPC_FILE="${PROTO_DIR}/trainer_pb2_grpc.py"
 if grep -q "^import trainer_pb2" "${GRPC_FILE}"; then
   # Use Python itself to do the replacement — avoids sed -i portability issues
-  "${PYTHON}" - <<'PYEOF'
-import pathlib, re
-p = pathlib.Path("proto/trainer_pb2_grpc.py")
+  "${PYTHON}" - "${GRPC_FILE}" <<'PYEOF'
+import pathlib, re, sys
+p = pathlib.Path(sys.argv[1])
 p.write_text(re.sub(r'^import trainer_pb2', 'from . import trainer_pb2', p.read_text(), flags=re.MULTILINE))
 PYEOF
 fi

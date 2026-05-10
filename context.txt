@@ -17,125 +17,154 @@ Local (worker clone): ~/distributed-resnet (created by bootstrap script)
 GitHub Pages: https://ruturaj-vasant.github.io/Distributed_Hetrogeneous_Training/
 
 
-# CURRENT STATUS (2026-05-08)
+# CURRENT STATUS (2026-05-09)
 
-EXP1 (solo baseline) running today — leader + 1 worker in separate terminal on same
-Mac. EXP2 (PS full grads) and EXP3 (PS TopK) scheduled for tomorrow when a second
-laptop is available.
+Phase 1 modularization complete. The flat leader.py/worker.py monoliths have been
+extracted into a structured trainer/ package. Entry points are now thin wrappers.
+All 5 e2e tests passing (17 assertions).
 
-Latest commit: b87c6d4 — per-worker step latency logging + round_ms in RunRecorder
+Phase 2 (product layer: pyproject.toml, cli/, examples/, dashboard) is next.
+
+Latest commits:
+  ae2710d — fix(tests): move to tests/, fix pre-existing MPS crash + T11 pool bug
+  b67d16a — refactor(phase-1): modularize into trainer/ package
+  452ec50 — chore: ignore comparison.png and experiment_commands.txt
 
 
 # COMPLETED WORK
 
-1. proto/trainer.proto — gRPC service with 5 RPCs:
-   Register, Heartbeat (bidi stream), GetAssignment, ExchangeGradients, GetClusterStatus
+1. proto/trainer.proto — gRPC service with 6 RPCs:
+   Register, Heartbeat (bidi stream), GetAssignment, ExchangeGradients,
+   GetClusterStatus, AdmitWorkers
 
 2. hardware_probe.py — cross-platform HW detection + microbenchmark score
    Score formula: cpu_cores×0.5 + ram×0.1 + cuda_vram×8 + mps_cores×0.3 + 50×(100/forward_ms)
 
-3. dataset.py — Tiny ImageNet-200 download/extract/reorganize
-   ensure_dataset(): downloads zip, extracts, reorganizes val/ to ImageFolder format
-   make_train_loader(): Subset with worker shard indices
-   make_val_loader(): full 10K val split for leader val-accuracy evaluation
-   Cache: ~/.cache/tiny-imagenet-200 (~236 MB)
+3. dataset.py — Tiny ImageNet-200 + CIFAR-10 download/extract/reorganize
+   ensure_dataset(), make_train_loader(), make_val_loader() for Tiny ImageNet
+   ensure_cifar10(), make_cifar10_train_loader(), make_cifar10_val_loader() for CIFAR-10
+   Unified interface: ensure_any_dataset(), make_any_train_loader(), make_any_val_loader()
+   Cache: ~/.cache/tiny-imagenet-200 (~236 MB), ~/.cache/cifar10
 
-4. leader.py — parameter server + CLI
-   - aio.server() with 256 MB message limits
-   - grpc.so_reuseport=0 + _kill_existing_leader() to prevent duplicate leaders
-   - Non-interactive mode (stdin not TTY → server.wait_for_termination())
-   - --model flag: resnet18/50/101
-   - --batch-size flag (default 32, scales proportionally per worker)
-   - --lr, --weight-decay, --topk, --epochs, --port, --data-root, --min-workers, --auto-start
-   - Score-proportional sharding: worker_fraction = worker_score / sum(all_scores)
-   - Late worker joining mid-run: _assign_late_worker() draws proportional shard,
-     unblocks GetAssignment immediately, new worker gets current model weights
-   - _count_alive() only counts assigned=True workers so late joiners don't block grad rounds
-   - Per-worker step latency tracking: _grad_arrival dict + _prev_round_end
-     Logs compute_ms (training step duration) and wait_ms (idle waiting for stragglers)
-     Marks slowest worker as "← straggler" when wait_ms > 200ms and >1 worker
-   - RunRecorder integration: log_step() every grad round, log_epoch() + val-accuracy
-     after each epoch via _run_val_sync()
-   - Recorder created at start_training(), closed on reset/quit
-   - status_printer: simplified — only prints Step/Epoch/Loss/Workers line (no table)
-   - Dead worker recovery + grad-sync timeout in heartbeat_monitor()
-   - asyncio.Condition for gradient sync (last worker to arrive aggregates)
-   - Weight delta approach (not full state dict) after first sync
+4. trainer/ package — Phase 1 modularization (2026-05-09)
 
-5. worker.py — worker implementation
-   - Self-bootstrap block at top (pure stdlib, runs before all imports):
-     Creates .venv, installs requirements.txt, generates proto stubs, re-execs inside venv
-     Skips install if .venv/.deps_hash matches MD5 of requirements.txt AND core imports pass
-   - --leader defaults to leader-macbook-pro.taila5426e.ts.net (no longer required arg)
-   - Auto-reconnect: when leader disconnects, worker sleeps 10s and re-registers with new leader
-     leader_disconnected flag distinguishes connection loss from explicit STOP command
-     GetAssignment RPC failure mid-wait also triggers reconnect (not crash)
-   - Two gRPC channels: async (aio) for heartbeat+GetAssignment, sync for ExchangeGradients
-   - Top-K gradient sparsification (configurable topk_k, default 50000)
-   - --dry-run flag: uses _SyntheticDataset (320 samples)
-   - --cache-dir bug fixed: value now passed to ensure_dataset() and make_train_loader()
-   - Connection retry loop with CLI knobs: --connect-timeout, --rpc-timeout,
-     --connect-retries, --retry-backoff, --max-retry-backoff
+   trainer/core/
+     errors.py       Custom exceptions + fmt_grpc_error() — translates gRPC stack traces
+                     to one-line human-readable messages (LeaderConnectionError, etc.)
+     logging.py      Centralized logging setup — consistent format across all roles
 
-6. run_recorder.py — per-run metrics logger
+   trainer/leader/
+     worker_state.py WorkerState dataclass + infer_device() utility
+     core.py         LeaderCore mixin — all computation methods:
+                       _pick_device, _init_model, _compute_shards, _assign_late_worker,
+                       _aggregate_and_step, _run_val_sync, _serialize_full_model, _count_alive
+     service.py      LeaderService(LeaderCore, gRPC servicer) — RPC handlers only:
+                       Register, Heartbeat, GetAssignment, ExchangeGradients,
+                       GetClusterStatus, AdmitWorkers, start_training, reset_training,
+                       heartbeat_monitor, status_printer
+     server.py       main(), cli_loop(), kill_existing_leader() — server startup + interactive CLI
+
+   trainer/worker/
+     bootstrap.py    stdlib-only venv + proto setup (safe before pip installs)
+     connection.py   gRPC channel factories + connect_and_register() with retry logic
+     gradients.py    compress_gradients(), apply_delta(), load_full_weights()
+     heartbeat.py    WorkerSharedState bulletin board + heartbeat_loop() bidi stream
+     training_loop.py training_loop() — inner for-loop, runs in thread pool
+     synthetic_data.py SyntheticDataset + make_synthetic_loader() for dry-run mode
+     proto_helpers.py hw_to_proto(), resolve_device(), parse_dataset_list()
+     runner.py       run(cfg) — outer reconnect + job loop, orchestrates all worker modules
+
+5. leader.py — thin entry point (~40 lines): argparse + asyncio.run(main(cfg))
+   All logic lives in trainer/leader/
+
+6. worker.py — thin entry point (~50 lines): bootstrap() + argparse + asyncio.run(run(cfg))
+   All logic lives in trainer/worker/
+
+7. run_recorder.py — per-run metrics logger
    Creates: runs/<model>__<dataset>__<optimizer>__topk<K>__<timestamp>/
    Writes: config.json, metrics.csv (step, loss, round_ms, epoch, val_acc), summary.json, loss.png
-   Tests redirect to /tmp/distributed_resnet_test_runs to avoid polluting runs/
 
-7. run_experiments.py — comparison/plotting tool
+8. run_experiments.py — comparison/plotting tool
    --list: show all runs under runs/
    --runs dir1 dir2 dir3 --labels "EXP1" "EXP2" "EXP3": generates comparison.png
-   Shows loss curves + val-accuracy per epoch side by side
 
-8. watch_cluster.py — live cluster monitor
+9. watch_cluster.py — live cluster monitor
    Polls GetClusterStatus every N seconds, prints worker table
-   Default --leader: leader-macbook-pro.taila5426e.ts.net
-   Only needs grpcio (no torch, no dataset)
 
-9. docs/index.html — GitHub Pages command reference
-   Dark brutalist design, one-click copy buttons for all commands
-   Sections: leader, worker (Mac/Windows), watch cluster, compare runs, flags tables, architecture
-   URL: https://ruturaj-vasant.github.io/Distributed_Hetrogeneous_Training/
-   Enable in repo Settings → Pages → main branch → /docs folder
+10. docs/index.html — GitHub Pages command reference (dark brutalist design)
+    URL: https://ruturaj-vasant.github.io/Distributed_Hetrogeneous_Training/
 
-10. test_e2e.py — 5 tests, 13 assertions, all passing
-    T1-T7: single worker happy path
-    T8: bidi heartbeat alive during training
-    T9: two workers proportional shards
-    T10: late worker accepted mid-run + has shard assigned
-    T11-T12: GetClusterStatus RPC
+11. tests/test_e2e.py — 5 tests, 17 assertions, all passing
+    T1-T7: single worker happy path (register → assign → 3 grad rounds → weight delta)
+    T8:    bidi heartbeat stream (5 beats, all responses received, last_heartbeat updated)
+    T9:    two workers 75/25 proportional shard split, both complete 3 steps
+    T10:   late worker admission + Phase-2 reshard (shard shrinks 100k→66k)
+    T11-12: GetClusterStatus RPC returns workers in admitted and pending pools
+    Run: python3 tests/test_e2e.py   OR   python -m pytest tests/
 
-11. scripts/worker_macos.sh — one-shot Mac bootstrap
-12. scripts/worker_windows.ps1 — one-shot Windows bootstrap (auto-detects CUDA version)
+12. scripts/
+    worker_macos.sh       Mac one-shot bootstrap
+    worker_windows.ps1    Windows one-shot bootstrap (auto-detects CUDA version)
+    worker_windows.sh     Windows bash alternative
+    generate_proto.sh     Regenerate proto stubs after editing .proto
 
-All commits pushed to main. Latest: b87c6d4
+
+# PHASE 2 PLAN (next session)
+
+Goal: make this a product — pip-installable, unified CLI, classroom examples, dashboard.
+
+P2-A: pyproject.toml + package install
+  - pip install -e . → dtrain-leader / dtrain-worker entry points (no PYTHONPATH fiddling)
+  - Replaces current argparse blocks in leader.py / worker.py
+  - Entry points call trainer.leader.server.main() and trainer.worker.runner.run()
+
+P2-B: Move remaining root modules into trainer/
+  - dataset.py       → trainer/data/ (split into tinyimagenet.py + cifar10.py + __init__)
+  - hardware_probe.py → trainer/utils/hardware.py
+  - run_recorder.py  → trainer/utils/recorder.py
+  - Update all import sites inside trainer/ (6 files)
+  - After this: project root has only entry points + config + docs dirs
+
+P2-C: cli/ directory (formal CLI layer)
+  - cli/leader_cli.py  — argument parsing + calls trainer.leader.server.main()
+  - cli/worker_cli.py  — argument parsing + calls trainer.worker.runner.run()
+  - Decoupled from trainer/ internals, testable in isolation
+
+P2-D: examples/ directory (classroom labs)
+  - examples/lab01_single_worker/    README + run script (EXP1 solo baseline)
+  - examples/lab02_two_workers/      README + run script (EXP2 PS full grads)
+  - examples/lab03_topk/             README + run script (EXP3 PS TopK)
+
+P2-E: docs/ expansion
+  - docs/architecture.md     system design, gRPC flow, sharding math
+  - docs/deployment.md       Tailscale setup, Windows CUDA guide, Mac MPS guide
+  - docs/index.html          update to reflect new CLI commands (dtrain-leader etc.)
+
+P2-F: trainer/dashboard/ — web UI (auto-opens when leader starts)
+  - FastAPI + WebSocket server on :8080, launched alongside gRPC on :50051
+  - Live worker table replacing watch_cluster.py
+  - Loss curve, step/epoch progress, straggler heatmap
+  - Leader CLI buttons (admit, start, reset) replacing terminal prompt
 
 
 # EXPERIMENT PLAN
 
-EXP1 — Solo baseline (TODAY, 2026-05-08)
-  Leader machine only: leader process + 1 worker in separate terminal
-  Command:
-    Terminal 1: python3 leader.py --model resnet18 --epochs 5 --lr 0.01 --batch-size 32 --topk 0
-    Terminal 2: python3 worker.py
-    Then type: start
-  Measures: time/epoch, val-acc, loss curve with no network overhead
-  Run saved to: runs/resnet18__tinyimagenet200__sgd__topkfull__<ts>/
+EXP1 — Solo baseline
+  Terminal 1: python3 leader.py --model resnet18 --epochs 5 --lr 0.01 --batch-size 32 --topk 0
+  Terminal 2: python3 worker.py
+  Type: start
+  Measures: time/epoch, val-acc, loss curve — no network overhead
 
-EXP2 — PS full gradients (TOMORROW)
-  Leader + local worker + friend's laptop as second worker
-  Command:
-    Terminal 1: python3 leader.py --model resnet18 --epochs 5 --lr 0.01 --batch-size 32 --topk 0
-    Terminal 2: python3 worker.py
-    Friend's Mac: python3 worker.py   (auto-connects to leader DNS)
-    Then type: start
-  Measures: speedup vs EXP1, communication cost (round_ms from latency logs)
+EXP2 — PS full gradients (two machines)
+  Terminal 1: python3 leader.py --model resnet18 --epochs 5 --lr 0.01 --batch-size 32 --topk 0
+  Terminal 2: python3 worker.py
+  Friend's Mac: python3 worker.py   (self-bootstraps on clone)
+  Type: start
+  Measures: speedup vs EXP1, round_ms from latency logs
 
-EXP3 — PS TopK sparsification (TOMORROW, same session as EXP2)
-  Same topology, leader with --topk 5000
-  Command:
-    Terminal 1: python3 leader.py --model resnet18 --epochs 5 --lr 0.01 --batch-size 32 --topk 5000
-    (quit previous leader → worker auto-reconnects → type start)
+EXP3 — PS TopK sparsification (same topology as EXP2)
+  Terminal 1: python3 leader.py --model resnet18 --epochs 5 --lr 0.01 --batch-size 32 --topk 5000
+  Type: start  (workers reconnect automatically after leader restart)
   Measures: accuracy delta vs EXP2, gradient payload size, round_ms improvement
 
 After all 3 runs:
@@ -143,20 +172,14 @@ After all 3 runs:
   python3 run_experiments.py --runs <exp1_dir> <exp2_dir> <exp3_dir> \
     --labels "EXP1 Solo" "EXP2 PS Full" "EXP3 PS TopK" --output comparison.png
 
-Then repeat with resnet101 for paper results.
-
 
 # IN-PROGRESS WORK
 
-Running EXP1 today. Monitoring with:
-  Terminal 3: python3 watch_cluster.py
+Phase 2 is next. Priority order: P2-A (pyproject.toml) → P2-B (move modules) →
+P2-C (cli/) → P2-F (dashboard) → P2-D (examples) → P2-E (docs expansion).
 
-Latency log format during multi-worker runs:
-  Step     5  loss=4.8123  round=2310ms  delta=44KB
-            laptop-a: compute=1120ms wait=1190ms  laptop-b: compute=2310ms wait=0ms ← straggler
-
-The straggler label appears when wait_ms > 200ms and there is more than 1 worker.
-round_ms is saved to metrics.csv for post-hoc analysis.
+P2-A and P2-B must happen together in one PR since pyproject.toml references
+the final package paths.
 
 
 # TECHNICAL ARCHITECTURE
@@ -165,86 +188,90 @@ round_ms is saved to metrics.csv for post-hoc analysis.
 - Transport: gRPC over Tailscale WireGuard VPN
 - Leader port: 50051 (default)
 - Protocol: protobuf (proto/trainer.proto)
-- Message size limit: 256 MB on both server (leader.py) and client channels (worker.py)
-- Leader disables grpc.so_reuseport to prevent multiple leader processes sharing 50051
-- Heartbeat interval: 5 seconds (asyncio.sleep(5) in worker heartbeat_loop)
+- Message size limit: 256 MB on both server and client channels
+- Leader disables grpc.so_reuseport to prevent multiple leader processes on 50051
+- Heartbeat interval: 5 seconds
 - Worker auto-reconnect after leader restart: 10 second retry interval
 
 ## gRPC Channel Design (worker)
-- async_ch = aio.insecure_channel(...) → for Heartbeat (bidi stream) + GetAssignment (blocking unary)
-- sync_ch = grpc.insecure_channel(...) → for ExchangeGradients (called from training thread)
-- Reason: training loop runs in asyncio.get_event_loop().run_in_executor(), can't use aio there
+- async_ch = aio.insecure_channel(...)  → Heartbeat (bidi stream) + GetAssignment (blocking unary)
+- sync_ch  = grpc.insecure_channel(...) → ExchangeGradients (called from training thread)
+- Reason: training loop runs in run_in_executor(), can't use aio there
 
-## Leader internals
+## Leader internals (trainer/leader/)
 - asyncio.Lock (_lock): guards _workers dict
 - asyncio.Condition (_grad_cond): gradient sync — last worker to arrive aggregates + notifies all
 - asyncio.Event (_training_started): set when operator types 'start' or auto-start fires
 - Per-worker asyncio.Queue (assignment_queue): start_training() puts sentinel, unblocks GetAssignment
 - heartbeat_monitor(): removes timed-out workers, handles dead-worker mid-sync
 - _grad_arrival dict + _prev_round_end: per-round latency tracking for straggler detection
-- _count_alive(): only counts workers with assigned=True (late joiners excluded from grad sync
-  until they complete GetAssignment and start training)
+- _count_alive(): only counts workers with assigned=True (late joiners excluded until assigned)
+- LeaderCore mixin: all computation methods — model init, aggregation, sharding, validation
+- LeaderService: gRPC handlers only, inherits LeaderCore
 
 ## Data flow per training step
 1. Worker: forward pass → loss.backward() → compress_gradients() [Top-K per layer]
 2. Worker: ExchangeGradients RPC → sends GradientPush (worker_id, step, loss, sparse_grads)
-   Leader records arrival time per worker in _grad_arrival
 3. Leader: collects from all alive+assigned workers (asyncio.Condition wait loop)
 4. Leader: last worker triggers _aggregate_and_step() → weighted average → optimizer.step()
-   Computes per-worker compute_ms and wait_ms, logs straggler if wait > 200ms
-5. Leader: serializes weight delta (new_weights - old_weights) → sends WeightUpdate
-   Logs round_ms to RunRecorder.log_step()
-6. Worker: apply_delta() → adds delta to model params in-place
+   Computes per-worker compute_ms and wait_ms, flags straggler if wait > 200ms
+5. Leader: serializes weight delta (new_weights - old_weights, float16) → WeightUpdate
+6. Worker: apply_delta() adds delta to local model params in-place
 
 ## Gradient compression
 Top-K sparsification: for each layer, keep topk_k elements by absolute value.
 Sends (indices, values, shape) tuples. Default topk_k=50000. topk_k=0 = full gradients.
+One device sync before loop (torch.mps.synchronize / torch.cuda.synchronize) to avoid
+per-layer implicit syncs.
 
 ## Sharding
 worker_fraction = worker_score / sum(all_scores)
-worker_samples = int(fraction × 100,000)  [Tiny ImageNet train size]
-batch_size scales proportionally (base from --batch-size flag, default 32, min 8, max 256)
-Late joiners: random sample from full dataset (may overlap — acceptable for PS)
+worker_samples  = int(fraction × train_samples)
+batch_size scales proportionally (base from --batch-size, default 32, min 8, max 256)
+Phase-2 reshard: when a late worker is admitted, all active workers are resharded
+proportionally and sent a RESHARD command via the next heartbeat response.
 
 ## RunRecorder output
 runs/<model>__<dataset>__<optimizer>__topk<K>__<timestamp>/
   config.json     hyperparameters snapshot
-  metrics.csv     columns: step, loss, round_ms, epoch, val_acc
-  summary.json    final_loss, final_val_acc, total_steps, epoch_accs
+  metrics.csv     columns: step, loss, round_ms, straggler_delay_s, epoch, val_acc
+  summary.json    final_loss, final_val_acc, total_steps, compression_ratio, throughput
   loss.png        loss curve (requires matplotlib)
 
 ## Tailscale
 Leader DNS: leader-macbook-pro.taila5426e.ts.net
-Worker DNS: devanshis-macbook-air.taila5426e.ts.net
 ALWAYS use the Tailscale magic DNS — never 127.0.0.1 or localhost, even for local tests
 
 
 # KEY DECISIONS & CONSTRAINTS
 
-1. Parameter Server over DDP: MPS + CUDA can't use NCCL. PS allows heterogeneous hardware.
+1. Parameter Server over DDP: MPS + CUDA can't use NCCL. PS handles heterogeneous hardware.
 
-2. Two gRPC channels per worker (async + sync): training thread uses run_in_executor.
+2. Two gRPC channels per worker (async + sync): training thread uses run_in_executor().
 
 3. Weight delta (not full state dict) per step: reduces bandwidth from ~170 MB to ~1-10 MB.
+   Delta serialized as float16 (halves size: 43 MB → 22 MB) with negligible precision loss.
 
 4. asyncio.Condition for gradient sync: "last worker aggregates" semantics.
 
-5. grpc.aio has NO sleep() — use asyncio.sleep() in async contexts.
+5. LeaderCore mixin: all computation methods in a mixin so self.* access patterns are
+   unchanged — zero risk of attribute bugs when splitting the class.
 
-6. Leader gRPC server needs explicit 256 MB message size options (default 4 MB rejects grads).
+6. Worker bootstrap (trainer/worker/bootstrap.py): stdlib-only, runs before third-party
+   imports. Creates .venv, installs requirements.txt, generates proto stubs, re-execs
+   inside venv via os.execv (Mac/Linux) or subprocess.run (Windows).
+   Deps skip: MD5 of requirements.txt cached in .venv/.deps_hash.
 
-7. Worker self-bootstrap: _bootstrap() uses only stdlib, runs before third-party imports,
-   creates .venv, installs deps, generates proto stubs, re-execs via os.execv on Mac/Linux.
-   Deps skip: MD5 hash of requirements.txt stored in .venv/.deps_hash; pip skipped if match.
+7. Late worker joining: accepted mid-run, gets proportional random shard + current weights.
+   _count_alive() excludes unassigned workers so they don't block existing grad rounds.
 
-8. Late worker joining: accepted mid-run, gets proportional random shard + current model weights.
-   _count_alive() excludes unassigned workers so they don't block existing gradient rounds.
+8. Auto-reconnect: leader_disconnected flag distinguishes gRPC failure from explicit STOP.
+   On disconnect: sleep 10s → re-register with new leader.
 
-9. Auto-reconnect: leader_disconnected flag in WorkerSharedState distinguishes gRPC failure
-   from explicit STOP command. On disconnect: sleep 10s → re-register with new leader.
+9. Test isolation: tests use CPU-only fake hardware to avoid MPS Metal assertion crashes
+   when two training threads call mps.synchronize() concurrently.
 
-10. Straggler detection: logged but not mitigated (out of scope for current 3-experiment plan).
-    grad_sync_timeout (120s) handles extreme stalls. Per-worker latency visible in logs + CSV.
+10. grad_sync_timeout (120s): handles extreme stalls when a worker dies mid-round.
 
 
 # IMPORTANT COMMANDS
@@ -263,10 +290,12 @@ python3 leader.py --model resnet18 --epochs 5 --lr 0.01 --batch-size 32
 --weight-decay 1e-4
 --data-root <path>         (default ~/.cache/tiny-imagenet-200)
 --auto-start               (start when min-workers threshold met)
+--grad-accum N             (accumulate N batches before syncing, default 1)
 
 ## Worker (any machine — self-bootstraps)
-python3 worker.py          (connects to leader-macbook-pro.taila5426e.ts.net by default)
-python3 worker.py --dry-run   (synthetic data, tests protocol only)
+python3 worker.py                    (connects to leader-macbook-pro.taila5426e.ts.net)
+python3 worker.py --dry-run          (synthetic data, tests protocol only)
+python3 worker.py --dataset cifar10  (pre-download CIFAR-10 instead)
 
 ## Fresh clone on remote machine (Mac)
 git clone https://github.com/Ruturaj-Vasant/Distributed_Hetrogeneous_Training.git ~/distributed-resnet
@@ -284,7 +313,11 @@ python3 run_experiments.py --list
 python3 run_experiments.py --runs <dir1> <dir2> <dir3> --labels "EXP1" "EXP2" "EXP3"
 
 ## Tests
-python3 test_e2e.py        (5 tests, 13 assertions, ~15 seconds)
+python3 tests/test_e2e.py            (5 tests, 17 assertions, ~20 seconds)
+python3 -m pytest tests/             (via pytest)
+
+## Proto regeneration
+bash scripts/generate_proto.sh
 
 ## Tailscale diagnostics
 tailscale ping leader-macbook-pro.taila5426e.ts.net
@@ -294,52 +327,57 @@ nc -zv leader-macbook-pro.taila5426e.ts.net 50051
 # FILE LAYOUT
 
 distributed-resnet/
-├── leader.py              # Parameter server + interactive CLI + gRPC server
-├── worker.py              # Worker: self-bootstrap → probe → register → train → push
-├── run_recorder.py        # Per-run metrics logger (CSV, JSON, PNG)
-├── run_experiments.py     # Comparison/plotting tool for EXP1/2/3
-├── hardware_probe.py      # Cross-platform HW detection + capability score
-├── dataset.py             # Tiny ImageNet-200 download, val setup, DataLoaders
-├── watch_cluster.py       # Live cluster status monitor (polls GetClusterStatus)
-├── test_e2e.py            # End-to-end smoke tests (5 tests, 13 assertions)
-├── generate_proto.sh      # Regenerate proto stubs after editing .proto
-├── requirements.txt       # torch, torchvision, grpcio, psutil, numpy, matplotlib
+├── leader.py              # Thin entry point: argparse + asyncio.run(main(cfg))
+├── worker.py              # Thin entry point: bootstrap() + argparse + asyncio.run(run(cfg))
+├── run_recorder.py        # Per-run metrics logger               [→ trainer/utils/ in Phase 2]
+├── run_experiments.py     # Comparison/plotting tool             [→ cli/ in Phase 2]
+├── hardware_probe.py      # Cross-platform HW detection + score  [→ trainer/utils/ in Phase 2]
+├── dataset.py             # Tiny ImageNet-200 + CIFAR-10         [→ trainer/data/ in Phase 2]
+├── watch_cluster.py       # Live cluster status monitor          [replaced by dashboard Phase 2]
 ├── context.txt            # THIS FILE — project memory
-├── docs/index.html        # GitHub Pages command reference (brutalist design)
-├── runs/                  # Per-run output dirs (gitignored)
+├── requirements.txt       # torch, torchvision, grpcio, psutil, numpy, matplotlib
+│
+├── trainer/               # Core package (Phase 1)
+│   ├── core/
+│   │   ├── errors.py      # Custom exceptions + gRPC → human error translation
+│   │   └── logging.py     # Centralized logging config
+│   ├── leader/
+│   │   ├── worker_state.py  # WorkerState dataclass + infer_device()
+│   │   ├── core.py          # LeaderCore mixin (model, aggregation, sharding, val)
+│   │   ├── service.py       # LeaderService(LeaderCore, gRPC) — RPC handlers only
+│   │   └── server.py        # main(), cli_loop(), kill_existing_leader()
+│   └── worker/
+│       ├── bootstrap.py     # stdlib-only venv + proto setup
+│       ├── connection.py    # gRPC channel factories + connect_and_register()
+│       ├── gradients.py     # compress_gradients, apply_delta, load_full_weights
+│       ├── heartbeat.py     # WorkerSharedState + heartbeat_loop()
+│       ├── training_loop.py # training_loop() — inner for-loop
+│       ├── synthetic_data.py  # SyntheticDataset + make_synthetic_loader()
+│       ├── proto_helpers.py   # hw_to_proto, resolve_device, parse_dataset_list
+│       └── runner.py          # run(cfg) — outer reconnect + job loop
+│
+├── tests/
+│   └── test_e2e.py        # 5 tests, 17 assertions (python3 tests/test_e2e.py)
+│
 ├── proto/
 │   ├── trainer.proto
 │   ├── trainer_pb2.py
 │   └── trainer_pb2_grpc.py
-└── scripts/
-    ├── worker_macos.sh    # Mac one-shot bootstrap (venv + deps + dataset + launch)
-    └── worker_windows.ps1 # Windows one-shot bootstrap (CUDA auto-detect)
-
-
-# RESUME HERE
-
-System is fully implemented and tested. Running EXP1 (solo) today.
-
-Tomorrow's session: connect friend's laptop as second worker for EXP2 and EXP3.
-Friend's machine: git clone + python3 worker.py (self-bootstrap handles everything).
-No manual venv or dep install needed — bootstrap detects and skips if already done.
-
-Sequence for tomorrow:
-  1. Start leader: python3 leader.py --model resnet18 --epochs 5 --lr 0.01 --topk 0
-  2. Start local worker: python3 worker.py
-  3. Friend starts worker: python3 worker.py  (on their machine, same command)
-  4. Type 'start' once both workers show as registered
-  5. Monitor: python3 watch_cluster.py
-  6. Watch for straggler labels in leader log if machines differ in speed
-  7. After run: python3 run_experiments.py --list to confirm run saved
-  8. Repeat with --topk 5000 for EXP3 (quit leader → workers reconnect → new leader → start)
-  9. Finally: run_experiments.py --runs <exp1> <exp2> <exp3> to generate comparison.png
+│
+├── scripts/
+│   ├── worker_macos.sh
+│   ├── worker_windows.ps1
+│   ├── worker_windows.sh
+│   └── generate_proto.sh  # Regenerate stubs after editing .proto
+│
+└── docs/
+    └── index.html         # GitHub Pages command reference
 
 
 # KNOWN ISSUES / RISKS
 
-1. [FIXED] gRPC SETTINGS timeout: duplicate leader processes on same port.
-   Fixed: grpc.so_reuseport=0 + _kill_existing_leader() on startup.
+1. [FIXED] gRPC port conflict: duplicate leader processes on same port.
+   Fixed: grpc.so_reuseport=0 + kill_existing_leader() on startup.
 
 2. [FIXED] grpc.aio has no sleep() — heartbeat crashed. Fixed: asyncio.sleep(5).
 
@@ -347,19 +385,25 @@ Sequence for tomorrow:
 
 4. [FIXED] Leader exited in subprocess mode. Fixed: isatty() check.
 
-5. [FIXED] Late worker rejection. Fixed: accepts mid-run, assigns shard immediately.
+5. [FIXED] Late worker rejection. Fixed: accepts mid-run, assigns shard + reshard.
 
 6. [FIXED] Worker exits on leader restart. Fixed: auto-reconnect loop with 10s retry.
 
-7. [RISK] ResNet-101 weight delta still ~44 MB per step on first exchange.
+7. [FIXED] Test 3 MPS crash: two training threads calling mps.synchronize() concurrently.
+   Fixed: test uses CPU-only fake hardware (protocol correctness, not GPU performance).
+
+8. [FIXED] T11 test bug: queried worker status before start_training() admitted workers.
+   Fixed: check both status.workers and status.pending_workers.
+
+9. [RISK] ResNet-101 weight delta still ~44 MB per step on first exchange.
    Mitigation: TopK compression reduces gradient payload.
 
-8. [KNOWN] Straggler detection logged but not mitigated.
-   grad_sync_timeout (120s) prevents full stall. Per-worker latency in CSV for analysis.
+10. [KNOWN] Straggler detection logged but not mitigated.
+    grad_sync_timeout (120s) prevents full stall. Per-worker latency in CSV for analysis.
 
-9. [KNOWN] Windows bootstrap not yet tested end-to-end on real CUDA hardware.
+11. [KNOWN] Windows bootstrap not yet tested end-to-end on real CUDA hardware.
 
-10. [KNOWN] MPS + asyncio.run_in_executor may have restrictions in some PyTorch versions.
+12. [KNOWN] MPS + asyncio.run_in_executor may have restrictions in some PyTorch versions.
     If MPS training hangs, pin training thread to main thread.
 
 

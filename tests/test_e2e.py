@@ -2,7 +2,8 @@
 test_e2e.py  —  End-to-end smoke test (no real dataset, no Tailscale needed)
 
 Run:
-    python3 test_e2e.py
+    python3 tests/test_e2e.py          # from project root
+    python3 -m pytest tests/           # via pytest
 
 What is verified:
     [T1] Worker registers and receives a worker_id
@@ -19,10 +20,14 @@ What is verified:
           leader waits for BOTH gradients before stepping
 """
 
+import sys
+from pathlib import Path
+# Ensure project root is on sys.path when run as `python tests/test_e2e.py`
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import argparse
 import asyncio
 import io
-import sys
 import time
 import traceback
 
