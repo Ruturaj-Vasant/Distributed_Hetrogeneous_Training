@@ -3,354 +3,39 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>dtrain dashboard</title>
-<style>
-  :root {
-    --bg:      #0d1117;
-    --surface: #161b22;
-    --border:  #30363d;
-    --text:    #e6edf3;
-    --muted:   #8b949e;
-    --blue:    #2563eb;
-    --green:   #22c55e;
-    --yellow:  #eab308;
-    --red:     #ef4444;
-    --orange:  #f97316;
-  }
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { background: var(--bg); color: var(--text); font-family: 'SF Mono', 'Fira Code', monospace; font-size: 13px; }
-
-  header {
-    display: flex; align-items: center; gap: 12px;
-    padding: 12px 20px; border-bottom: 1px solid var(--border);
-    background: var(--surface);
-  }
-  header h1 { font-size: 16px; letter-spacing: 0.05em; color: var(--blue); }
-  #conn-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--red); margin-left: auto; }
-  #conn-dot.ok { background: var(--green); }
-  #conn-label { color: var(--muted); font-size: 11px; }
-
-  .cfg-pill {
-    background: var(--bg); border: 1px solid var(--border);
-    border-radius: 4px; padding: 2px 8px; color: var(--muted); font-size: 11px;
-  }
-
-  .stats-bar {
-    display: flex; gap: 0; border-bottom: 1px solid var(--border);
-  }
-  .stat {
-    flex: 1; padding: 14px 20px; border-right: 1px solid var(--border);
-    display: flex; flex-direction: column; gap: 4px;
-  }
-  .stat:last-child { border-right: none; }
-  .stat-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); }
-  .stat-value { font-size: 22px; font-weight: 700; }
-  .stat-value.waiting { color: var(--yellow); }
-  .stat-value.training { color: var(--green); }
-
-  main { padding: 20px; display: flex; flex-direction: column; gap: 20px; }
-
-  .card {
-    background: var(--surface); border: 1px solid var(--border); border-radius: 6px; overflow: hidden;
-  }
-  .card-header {
-    display: flex; align-items: center; justify-content: space-between;
-    padding: 10px 16px; border-bottom: 1px solid var(--border);
-    font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted);
-  }
-
-  table { width: 100%; border-collapse: collapse; }
-  th { padding: 8px 16px; text-align: left; font-size: 10px; text-transform: uppercase;
-       letter-spacing: 0.08em; color: var(--muted); border-bottom: 1px solid var(--border); }
-  td { padding: 9px 16px; border-bottom: 1px solid var(--border); }
-  tr:last-child td { border-bottom: none; }
-  tr:hover td { background: rgba(255,255,255,0.02); }
-
-  .badge {
-    display: inline-block; padding: 2px 8px; border-radius: 3px;
-    font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; font-weight: 600;
-  }
-  .badge-training  { background: rgba(34,197,94,.15);  color: var(--green);  }
-  .badge-idle      { background: rgba(139,148,158,.15); color: var(--muted);  }
-  .badge-dead      { background: rgba(239,68,68,.15);  color: var(--red);    }
-  .badge-waiting   { background: rgba(234,179,8,.15);  color: var(--yellow); }
-
-  .controls { display: flex; gap: 8px; }
-  button {
-    padding: 7px 16px; border-radius: 5px; border: 1px solid var(--border);
-    background: var(--surface); color: var(--text); cursor: pointer; font-size: 12px;
-    font-family: inherit; transition: background 0.15s;
-  }
-  button:hover { background: var(--border); }
-  button.primary { background: var(--blue); border-color: var(--blue); color: #fff; }
-  button.primary:hover { background: #1d4ed8; }
-  button.danger  { border-color: var(--red); color: var(--red); }
-  button.danger:hover { background: rgba(239,68,68,.1); }
-  button:disabled { opacity: 0.4; cursor: not-allowed; }
-
-  canvas { display: block; width: 100%; height: 120px; }
-
-  #pending-section { display: none; }
-
-  .empty { padding: 24px 16px; color: var(--muted); text-align: center; }
-  .hb-ok  { color: var(--green); }
-  .hb-warn { color: var(--yellow); }
-  .hb-dead { color: var(--red); }
-</style>
+<title>dtrain dashboard launcher</title>
+<link rel="stylesheet" href="/static/common.css">
 </head>
 <body>
-
 <header>
   <h1>dtrain</h1>
-  <span id="cfg-pill" class="cfg-pill">—</span>
-  <span id="conn-dot"></span>
-  <span id="conn-label">connecting…</span>
+  <span class="cfg-pill">dashboard launcher</span>
 </header>
-
-<div class="stats-bar">
-  <div class="stat">
-    <span class="stat-label">Phase</span>
-    <span class="stat-value waiting" id="stat-phase">waiting</span>
-  </div>
-  <div class="stat">
-    <span class="stat-label">Epoch</span>
-    <span class="stat-value" id="stat-epoch">—</span>
-  </div>
-  <div class="stat">
-    <span class="stat-label">Step</span>
-    <span class="stat-value" id="stat-step">—</span>
-  </div>
-  <div class="stat">
-    <span class="stat-label">Loss</span>
-    <span class="stat-value" id="stat-loss">—</span>
-  </div>
-  <div class="stat">
-    <span class="stat-label">Workers</span>
-    <span class="stat-value" id="stat-workers">—</span>
-  </div>
-</div>
-
-<main>
-
-  <!-- Controls -->
-  <div class="card">
-    <div class="card-header">
-      <span>Controls</span>
+<main class="launcher grid-3">
+  <a class="card launcher-card" href="/leader">
+    <div class="card-header">Leader</div>
+    <div class="card-body">
+      <h2>Leader Control</h2>
+      <p>Start, reset, admit workers, inspect training config, and watch the loss curve.</p>
+      <div class="open">Open /leader</div>
     </div>
-    <div style="padding:12px 16px;">
-      <div class="controls">
-        <button class="primary" id="btn-start" onclick="apiPost('/api/start')">Start Training</button>
-        <button id="btn-admit-all" onclick="admitAll()">Admit All Pending</button>
-        <button class="danger" id="btn-reset" onclick="apiPost('/api/reset')">Reset</button>
-      </div>
+  </a>
+  <a class="card launcher-card" href="/worker">
+    <div class="card-header">Worker</div>
+    <div class="card-body">
+      <h2>Worker Panel</h2>
+      <p>Inspect connected worker status, device, heartbeat age, local loss, steps, and shard size.</p>
+      <div class="open">Open /worker</div>
     </div>
-  </div>
-
-  <!-- Loss curve -->
-  <div class="card">
-    <div class="card-header"><span>Loss Curve</span></div>
-    <canvas id="loss-canvas" height="120"></canvas>
-  </div>
-
-  <!-- Workers -->
-  <div class="card">
-    <div class="card-header">
-      <span>Active Workers</span>
-      <span id="worker-count" style="color:var(--text)">0</span>
+  </a>
+  <a class="card launcher-card" href="/watch">
+    <div class="card-header">Watch</div>
+    <div class="card-body">
+      <h2>Cluster Watch</h2>
+      <p>Browser version of the watch panel with active and pending worker tables.</p>
+      <div class="open">Open /watch</div>
     </div>
-    <div id="worker-body">
-      <div class="empty">No workers connected.</div>
-    </div>
-  </div>
-
-  <!-- Pending -->
-  <div class="card" id="pending-section">
-    <div class="card-header">
-      <span>Pending Workers</span>
-      <span id="pending-count" style="color:var(--yellow)">0</span>
-    </div>
-    <div id="pending-body"></div>
-  </div>
-
+  </a>
 </main>
-
-<script>
-// ── State ─────────────────────────────────────────────────────────────────────
-const lossHistory = [];
-const MAX_LOSS_POINTS = 200;
-
-// ── Fetch history on load ─────────────────────────────────────────────────────
-fetch('/api/history')
-  .then(r => r.json())
-  .then(d => {
-    if (d.loss && d.loss.length) {
-      lossHistory.push(...d.loss);
-      if (lossHistory.length > MAX_LOSS_POINTS) lossHistory.splice(0, lossHistory.length - MAX_LOSS_POINTS);
-      drawLoss();
-    }
-  })
-  .catch(() => {});
-
-// ── WebSocket ─────────────────────────────────────────────────────────────────
-let ws;
-function connect() {
-  ws = new WebSocket(`ws://${location.host}/ws`);
-  ws.onopen = () => {
-    document.getElementById('conn-dot').className = 'ok';
-    document.getElementById('conn-label').textContent = 'connected';
-  };
-  ws.onmessage = e => render(JSON.parse(e.data));
-  ws.onclose = () => {
-    document.getElementById('conn-dot').className = '';
-    document.getElementById('conn-label').textContent = 'reconnecting…';
-    setTimeout(connect, 2000);
-  };
-}
-connect();
-
-// ── Render ────────────────────────────────────────────────────────────────────
-function render(s) {
-  // Stats bar
-  const phaseEl = document.getElementById('stat-phase');
-  phaseEl.textContent = s.phase;
-  phaseEl.className = `stat-value ${s.phase}`;
-  document.getElementById('stat-epoch').textContent   = s.phase === 'waiting' ? '—' : s.epoch;
-  document.getElementById('stat-step').textContent    = s.phase === 'waiting' ? '—' : s.step;
-  document.getElementById('stat-loss').textContent    = s.loss > 0 ? s.loss.toFixed(4) : '—';
-  document.getElementById('stat-workers').textContent = s.workers.length;
-
-  // Config pill
-  const c = s.cfg;
-  document.getElementById('cfg-pill').textContent =
-    `${c.model} · ${c.dataset} · ep=${c.epochs} · lr=${c.lr} · topk=${c.topk === 0 ? 'full' : c.topk}`;
-
-  // Loss history
-  if (s.loss > 0) {
-    lossHistory.push(s.loss);
-    if (lossHistory.length > MAX_LOSS_POINTS) lossHistory.shift();
-    drawLoss();
-  }
-
-  // Workers table
-  const wcount = document.getElementById('worker-count');
-  wcount.textContent = s.workers.length;
-  const wbody = document.getElementById('worker-body');
-  if (s.workers.length === 0) {
-    wbody.innerHTML = '<div class="empty">No workers connected.</div>';
-  } else {
-    wbody.innerHTML = `
-      <table>
-        <thead><tr>
-          <th>Hostname</th><th>Device</th><th>Status</th>
-          <th>Score</th><th>Shard</th><th>Loss</th><th>Steps</th><th>Heartbeat</th>
-        </tr></thead>
-        <tbody>
-          ${s.workers.map(w => {
-            const alive = w.alive;
-            const statusClass = !alive ? 'dead' : w.status;
-            const statusLabel = !alive ? 'dead' : w.status;
-            const hbAgo = w.heartbeat_ago;
-            const hbClass = hbAgo < 10 ? 'hb-ok' : hbAgo < 30 ? 'hb-warn' : 'hb-dead';
-            const shard = w.shard_size > 0 ? w.shard_size.toLocaleString() : '—';
-            return `<tr>
-              <td>${esc(w.hostname)}</td>
-              <td style="color:var(--muted)">${esc(w.accel)}</td>
-              <td><span class="badge badge-${statusClass}">${statusLabel}</span></td>
-              <td>${w.score}</td>
-              <td>${shard}</td>
-              <td>${w.last_loss > 0 ? w.last_loss.toFixed(4) : '—'}</td>
-              <td>${w.steps}</td>
-              <td class="${hbClass}">${hbAgo}s ago</td>
-            </tr>`;
-          }).join('')}
-        </tbody>
-      </table>`;
-  }
-
-  // Pending section
-  const ps = document.getElementById('pending-section');
-  const pb = document.getElementById('pending-body');
-  const pc = document.getElementById('pending-count');
-  if (s.pending.length === 0) {
-    ps.style.display = 'none';
-  } else {
-    ps.style.display = 'block';
-    pc.textContent = s.pending.length;
-    pb.innerHTML = `
-      <table>
-        <thead><tr><th>Hostname</th><th>Device</th><th>Score</th><th>Action</th></tr></thead>
-        <tbody>
-          ${s.pending.map(p => `<tr>
-            <td>${esc(p.hostname)}</td>
-            <td style="color:var(--muted)">${esc(p.accel)}</td>
-            <td>${p.score}</td>
-            <td><button onclick="admitOne('${esc(p.worker_id)}')">Admit</button></td>
-          </tr>`).join('')}
-        </tbody>
-      </table>`;
-  }
-}
-
-// ── Loss canvas ───────────────────────────────────────────────────────────────
-function drawLoss() {
-  const canvas = document.getElementById('loss-canvas');
-  const dpr = window.devicePixelRatio || 1;
-  canvas.width  = canvas.offsetWidth  * dpr;
-  canvas.height = canvas.offsetHeight * dpr;
-  const ctx = canvas.getContext('2d');
-  ctx.scale(dpr, dpr);
-  const W = canvas.offsetWidth, H = canvas.offsetHeight;
-  const pad = { top: 10, right: 16, bottom: 10, left: 16 };
-
-  const data = lossHistory;
-  if (data.length < 2) return;
-
-  const minV = Math.min(...data), maxV = Math.max(...data);
-  const range = maxV - minV || 1;
-
-  const x = i => pad.left + (i / (data.length - 1)) * (W - pad.left - pad.right);
-  const y = v => pad.top + (1 - (v - minV) / range) * (H - pad.top - pad.bottom);
-
-  ctx.clearRect(0, 0, W, H);
-
-  // Gradient fill
-  const grad = ctx.createLinearGradient(0, pad.top, 0, H - pad.bottom);
-  grad.addColorStop(0, 'rgba(37,99,235,0.3)');
-  grad.addColorStop(1, 'rgba(37,99,235,0)');
-
-  ctx.beginPath();
-  ctx.moveTo(x(0), y(data[0]));
-  for (let i = 1; i < data.length; i++) ctx.lineTo(x(i), y(data[i]));
-  ctx.lineTo(x(data.length - 1), H - pad.bottom);
-  ctx.lineTo(x(0), H - pad.bottom);
-  ctx.closePath();
-  ctx.fillStyle = grad;
-  ctx.fill();
-
-  // Line
-  ctx.beginPath();
-  ctx.moveTo(x(0), y(data[0]));
-  for (let i = 1; i < data.length; i++) ctx.lineTo(x(i), y(data[i]));
-  ctx.strokeStyle = '#2563eb';
-  ctx.lineWidth = 1.5;
-  ctx.stroke();
-}
-
-window.addEventListener('resize', drawLoss);
-
-// ── API calls ─────────────────────────────────────────────────────────────────
-function apiPost(url, body = {}) {
-  fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
-    .catch(e => console.warn(url, e));
-}
-
-function admitAll() { apiPost('/api/admit', { worker_ids: [] }); }
-function admitOne(id) { apiPost('/api/admit', { worker_ids: [id] }); }
-
-function esc(s) {
-  return String(s).replace(/[&<>"']/g, c =>
-    ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
-}
-</script>
 </body>
 </html>

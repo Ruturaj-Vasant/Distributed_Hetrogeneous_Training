@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import os
 import time
 from typing import TYPE_CHECKING
 
@@ -39,6 +40,8 @@ class LeaderCore:
 
     @staticmethod
     def _pick_device() -> torch.device:
+        if os.environ.get("DTRAIN_FORCE_CPU") == "1":
+            return torch.device("cpu")
         if torch.cuda.is_available():
             return torch.device("cuda:0")
         try:

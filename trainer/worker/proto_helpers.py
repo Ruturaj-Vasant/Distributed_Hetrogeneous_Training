@@ -3,6 +3,7 @@ trainer/worker/proto_helpers.py — Protobuf / device conversion utilities.
 """
 from __future__ import annotations
 
+import os
 import torch
 
 from proto import trainer_pb2
@@ -44,6 +45,8 @@ def resolve_device(suggested: str) -> torch.device:
     Trust the leader's device suggestion only if that device exists locally;
     falls back gracefully rather than crashing.
     """
+    if os.environ.get("DTRAIN_FORCE_CPU") == "1":
+        return torch.device("cpu")
     if suggested.startswith("cuda"):
         if torch.cuda.is_available():
             idx = int(suggested.split(":")[-1]) if ":" in suggested else 0

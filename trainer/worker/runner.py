@@ -38,6 +38,13 @@ async def run(cfg) -> None:
     hw_result = probe()
     hw        = hw_result.hw
     bm        = hw_result.benchmark
+    for a in hw.accelerators:
+        if a.type.value == "mps":
+            log.info(f"  Accelerator: MPS — {a.name} ({a.gpu_cores} GPU cores)")
+        elif a.type.value == "cuda":
+            log.info(f"  Accelerator: CUDA — {a.name} {a.vram_gb:.0f} GB VRAM")
+        else:
+            log.info(f"  Accelerator: CPU — {a.name} ({hw.cpu_cores} cores, {hw.ram_gb:.0f} GB RAM)")
     log.info(
         f"Score={bm.score:.1f}  "
         f"Bench={bm.forward_ms:.1f}ms  "

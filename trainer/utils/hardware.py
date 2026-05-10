@@ -4,6 +4,7 @@ import platform
 import socket
 import sys
 import time
+import os
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
@@ -59,7 +60,9 @@ def _detect_hardware() -> HardwareInfo:
 
     accelerators: list[AcceleratorInfo] = []
 
-    if torch.cuda.is_available():
+    force_cpu = os.environ.get("DTRAIN_FORCE_CPU") == "1"
+
+    if not force_cpu and torch.cuda.is_available():
         for i in range(torch.cuda.device_count()):
             props = torch.cuda.get_device_properties(i)
             vram  = props.total_memory / (1024 ** 3)
@@ -72,7 +75,7 @@ def _detect_hardware() -> HardwareInfo:
                 gpu_cores = props.multi_processor_count * 128,
                 tflops    = round(tflops, 2),
             ))
-    elif _mps_available():
+    elif not force_cpu and _mps_available():
         accelerators.append(_mps_info())
 
     accelerators.append(AcceleratorInfo(
@@ -204,6 +207,8 @@ def _free_memory_gb(device: "torch.device") -> float:
 
 def _primary_device() -> "torch.device":
     import torch
+    if os.environ.get("DTRAIN_FORCE_CPU") == "1":
+        return torch.device("cpu")
     if torch.cuda.is_available():
         return torch.device("cuda:0")
     if _mps_available():
@@ -234,13 +239,34 @@ def _compute_score(hw: HardwareInfo, forward_ms: float) -> float:
 
 
 def probe() -> ProbeResult:
+    import logging
+    log = logging.getLogger("hardware")
+
     hw     = _detect_hardware()
     device = _primary_device()
 
-    print(f"[probe] Running benchmark on device: {device} ...")
+    accel_names = [
+        f"{a.type.value.upper()}({a.name})" for a in hw.accelerators
+        if a.type != AccelType.CPU
+    ] or ["CPU-only"]
+    log.info(f"Detected accelerators: {', '.join(accel_names)}")
+
+    # Warn if we're on macOS but MPS wasn't found — common when PyTorch
+    # is installed for the wrong architecture or macOS < 12.3.
+    if platform.system() == "Darwin" and device.type == "cpu":
+        log.warning(
+            "Running on CPU despite being on macOS. MPS not available. "
+            "Check: torch.backends.mps.is_available() and macOS >= 12.3."
+        )
+
+    log.info(f"Benchmark device: {device}")
     forward_ms, free_gb = _run_benchmark(device)
 
     score = _compute_score(hw, forward_ms)
+    log.info(
+        f"Benchmark done — forward_ms={forward_ms:.1f}  "
+        f"score={score:.1f}  free_mem={free_gb:.1f}GB"
+    )
 
     benchmark = BenchmarkResult(
         score          = score,

@@ -135,6 +135,26 @@ Latest commits:
     index.html            Updated GitHub Pages command reference to dtrain-* entry points,
                           dashboard URL, dtrain-watch, and dtrain-compare
 
+15. Local smoke test + runtime fixes (2026-05-09)
+    [TAG: codex-local-smoke-2026-05-09]
+    - Fixed pyproject.toml editable install backend: setuptools.build_meta
+    - Added DTRAIN_FORCE_CPU=1 escape hatch for local smoke tests / MPS probe issues
+    - Fixed dtrain-leader quit path to return cleanly instead of raising SystemExit
+    - Verified one leader + one dry-run worker + dtrain-watch + dashboard WebSocket
+    - Smoke run artifact: runs/resnet18__tinyimagenet200__sgd__topkfull__20260509_230623
+    - DTRAIN_FORCE_CPU=1 python3 -m pytest tests/ passes: 5 tests
+    - Note: Tailscale was installed but stopped, so leader-macbook-pro.taila5426e.ts.net
+      did not resolve during the local test; used Mac-1170.lan only for local smoke validation.
+
+16. Dashboard split into three web panels (2026-05-09)
+    [TAG: codex-three-dashboard-pages-2026-05-09]
+    - Dashboard server now serves /leader, /worker, /watch plus / launcher
+    - Shared assets live in trainer/dashboard/static/common.css and dashboard.js
+    - /leader: controls, loss curve, active workers, pending admission
+    - /worker: worker-focused detail panel and worker table
+    - /watch: browser version of cluster watch tables
+    - pyproject.toml package data includes dashboard HTML/CSS/JS static assets
+
 
 # PHASE 2 PLAN
 

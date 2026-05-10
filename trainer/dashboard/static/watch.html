@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>dtrain watch</title>
+<link rel="stylesheet" href="/static/common.css">
+</head>
+<body>
+<header>
+  <h1>dtrain watch</h1>
+  <span id="cfg-pill" class="cfg-pill">-</span>
+  <nav>
+    <a href="/leader">Leader</a>
+    <a href="/worker">Worker</a>
+    <a class="active" href="/watch">Watch</a>
+  </nav>
+  <span id="conn-dot"></span>
+  <span id="conn-label">connecting...</span>
+</header>
+<div class="stats-bar">
+  <div class="stat"><span class="stat-label">Phase</span><span class="stat-value waiting" id="stat-phase">waiting</span></div>
+  <div class="stat"><span class="stat-label">Epoch</span><span class="stat-value" id="stat-epoch">-</span></div>
+  <div class="stat"><span class="stat-label">Step</span><span class="stat-value" id="stat-step">-</span></div>
+  <div class="stat"><span class="stat-label">Loss</span><span class="stat-value" id="stat-loss">-</span></div>
+  <div class="stat"><span class="stat-label">Workers</span><span class="stat-value" id="stat-workers">-</span></div>
+</div>
+<main>
+  <section class="card">
+    <div class="card-header">
+      <span>Admitted Workers</span>
+      <button onclick="admitAll()">Admit All Pending</button>
+    </div>
+    <div id="watch-workers"></div>
+  </section>
+  <section class="card">
+    <div class="card-header">Pending Workers</div>
+    <div id="watch-pending"></div>
+  </section>
+</main>
+<script src="/static/dashboard.js"></script>
+<script>initDashboard('watch');</script>
+</body>
+</html>

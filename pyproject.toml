@@ -1,6 +1,6 @@
 [build-system]
 requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.backends.legacy:build"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "dtrain"
@@ -40,6 +40,7 @@ include = ["trainer*", "cli*", "proto*"]
 
 [tool.setuptools.package-data]
 "proto" = ["*.proto"]
+"trainer.dashboard" = ["static/*.html", "static/*.css", "static/*.js"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

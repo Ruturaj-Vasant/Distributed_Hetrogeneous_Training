@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import os
 import signal
-import sys
 import time
 
 from grpc import aio
@@ -101,7 +100,7 @@ async def cli_loop(service: LeaderService) -> None:
                 print(f"  Not found / already active: {list(resp.not_found_ids)}")
         elif cmd in ("quit", "exit", "q"):
             log.info("Shutting down.")
-            sys.exit(0)
+            return
         else:
             print(f"  Unknown command: {cmd!r}")
             print("  Try: admit [id ...] | admit all | start | status | reset | quit")
@@ -144,7 +143,7 @@ async def main(cfg) -> None:
         await _dashboard_serve(service, port=dashboard_port)
         log.info(f"Dashboard        : http://localhost:{dashboard_port}")
 
-    if sys.stdin.isatty():
+    if os.isatty(0):
         try:
             await cli_loop(service)
         finally:

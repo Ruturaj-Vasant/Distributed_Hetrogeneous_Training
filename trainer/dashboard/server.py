@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Set
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 
 if TYPE_CHECKING:
     from trainer.leader.service import LeaderService
@@ -16,6 +17,7 @@ if TYPE_CHECKING:
 _STATIC = Path(__file__).parent / "static"
 
 app = FastAPI(title="dtrain", docs_url=None, redoc_url=None)
+app.mount("/static", StaticFiles(directory=_STATIC), name="static")
 
 _service: "LeaderService | None" = None
 _clients: Set[WebSocket] = set()
@@ -103,6 +105,21 @@ async def _broadcast_loop() -> None:
 @app.get("/", response_class=HTMLResponse)
 async def index():
     return (_STATIC / "index.html").read_text()
+
+
+@app.get("/leader", response_class=HTMLResponse)
+async def leader_page():
+    return (_STATIC / "leader.html").read_text()
+
+
+@app.get("/worker", response_class=HTMLResponse)
+async def worker_page():
+    return (_STATIC / "worker.html").read_text()
+
+
+@app.get("/watch", response_class=HTMLResponse)
+async def watch_page():
+    return (_STATIC / "watch.html").read_text()
 
 
 @app.websocket("/ws")

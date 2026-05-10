@@ -40,11 +40,16 @@ async def heartbeat_loop(
 ) -> None:
     """
     Bidirectional heartbeat stream.
-    Worker sends status every 5 s; leader replies with a command.
+    Worker sends status every 2 s; leader replies with a command.
     Runs as an asyncio background task for the worker's entire lifetime.
+    Stopped only by task cancellation (runner.py finally block) or a STOP
+    command — NOT by shared.stop, so reshard does not kill the stream.
     """
     async def _requests():
-        while not shared.stop:
+        # Runs until this coroutine is cancelled — never exits on shared.stop
+        # so that a RESHARD (which sets shared.stop to exit the training thread)
+        # does not also kill the heartbeat stream.
+        while True:
             yield trainer_pb2.HeartbeatRequest(
                 worker_id       = worker_id,
                 status          = shared.status,
@@ -52,7 +57,7 @@ async def heartbeat_loop(
                 steps_completed = shared.steps,
                 timestamp_utc   = int(time.time()),
             )
-            await asyncio.sleep(5)
+            await asyncio.sleep(2)
 
     try:
         async for resp in stub.Heartbeat(_requests()):
@@ -76,6 +81,9 @@ async def heartbeat_loop(
                 )
                 shared.reshard_indices    = list(ns.indices)
                 shared.reshard_batch_size = ns.local_batch_size
+                # Signal the training thread to exit and rebuild the loader.
+                # Do NOT return here — the heartbeat stream must stay alive
+                # so the leader keeps seeing this worker during reshard.
                 shared.stop = True
     except asyncio.CancelledError:
         pass

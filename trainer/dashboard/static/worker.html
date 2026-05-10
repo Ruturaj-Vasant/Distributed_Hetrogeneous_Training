@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>dtrain worker</title>
+<link rel="stylesheet" href="/static/common.css">
+</head>
+<body>
+<header>
+  <h1>dtrain worker</h1>
+  <span id="cfg-pill" class="cfg-pill">-</span>
+  <nav>
+    <a href="/leader">Leader</a>
+    <a class="active" href="/worker">Worker</a>
+    <a href="/watch">Watch</a>
+  </nav>
+  <span id="conn-dot"></span>
+  <span id="conn-label">connecting...</span>
+</header>
+<div class="stats-bar">
+  <div class="stat"><span class="stat-label">Phase</span><span class="stat-value waiting" id="stat-phase">waiting</span></div>
+  <div class="stat"><span class="stat-label">Epoch</span><span class="stat-value" id="stat-epoch">-</span></div>
+  <div class="stat"><span class="stat-label">Step</span><span class="stat-value" id="stat-step">-</span></div>
+  <div class="stat"><span class="stat-label">Loss</span><span class="stat-value" id="stat-loss">-</span></div>
+  <div class="stat"><span class="stat-label">Workers</span><span class="stat-value" id="stat-workers">-</span></div>
+</div>
+<main class="grid-2">
+  <section class="card">
+    <div class="card-header">Primary Worker Detail</div>
+    <div class="card-body" id="worker-detail">
+      <div class="empty">No worker has connected yet.</div>
+    </div>
+  </section>
+  <section class="card">
+    <div class="card-header">Loss Curve</div>
+    <canvas id="loss-canvas" height="140"></canvas>
+  </section>
+  <section class="card" style="grid-column:1 / -1;">
+    <div class="card-header">All Workers</div>
+    <div id="worker-list"></div>
+  </section>
+</main>
+<script src="/static/dashboard.js"></script>
+<script>initDashboard('worker');</script>
+</body>
+</html>
