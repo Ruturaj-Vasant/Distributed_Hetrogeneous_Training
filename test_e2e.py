@@ -33,8 +33,9 @@ import grpc
 from grpc import aio
 
 from proto import trainer_pb2, trainer_pb2_grpc
-from leader import LeaderService
-from worker import compress_gradients, apply_delta, load_full_weights, _resolve_device
+from trainer.leader.service import LeaderService
+from trainer.worker.gradients import compress_gradients, apply_delta, load_full_weights
+from trainer.worker.proto_helpers import resolve_device as _resolve_device
 
 # ── Test parameters ───────────────────────────────────────────────────────────
 
@@ -78,7 +79,10 @@ def _make_cfg(**overrides) -> argparse.Namespace:
 
 
 def _fake_hw(hostname: str = "test-worker", score: float = 1000.0) -> tuple:
-    """Returns (HardwareInfo proto, BenchmarkResult proto)."""
+    """Returns (HardwareInfo proto, BenchmarkResult proto).
+    Uses CPU-only hardware so concurrent multi-worker tests don't trigger
+    Metal/CUDA command-buffer contention on the test machine's GPU.
+    """
     hw = trainer_pb2.HardwareInfo(
         hostname       = hostname,
         os             = "darwin",
@@ -86,11 +90,7 @@ def _fake_hw(hostname: str = "test-worker", score: float = 1000.0) -> tuple:
         torch_version  = torch.__version__,
         cpu_cores      = 8,
         ram_gb         = 16.0,
-        accelerators   = [trainer_pb2.AcceleratorInfo(
-            type      = trainer_pb2.AcceleratorInfo.MPS,
-            name      = "Apple M3 Pro",
-            gpu_cores = 14,
-        )],
+        accelerators   = [],   # CPU-only: avoids MPS/CUDA contention in concurrent tests
     )
     bm = trainer_pb2.BenchmarkResult(
         score          = score,
@@ -463,10 +463,14 @@ async def test_cluster_status_rpc(port: int) -> None:
             _query_status(),
             _trigger(),
         )
-        _check("T11 status has workers",        len(status.workers) >= 1)
-        _check("T12 worker hostname in status", any(
-            w.hostname == "laptop-c" for w in status.workers
-        ))
+        # At 0.2 s (before start_training at 0.4 s) the worker is still in the
+        # pending pool, so check both admitted and pending workers.
+        all_hostnames = (
+            [w.hostname for w in status.workers] +
+            [w.hostname for w in status.pending_workers]
+        )
+        _check("T11 status has workers",        len(all_hostnames) >= 1)
+        _check("T12 worker hostname in status", "laptop-c" in all_hostnames)
     finally:
         await server.stop(grace=1)
 
